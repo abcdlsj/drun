@@ -10,6 +10,45 @@ import (
 	"strings"
 )
 
+// Color constants for terminal output
+const (
+	ColorReset  = "\033[0m"
+	ColorRed    = "\033[31m"
+	ColorGreen  = "\033[32m"
+	ColorYellow = "\033[33m"
+	ColorBlue   = "\033[34m"
+	ColorPurple = "\033[35m"
+	ColorCyan   = "\033[36m"
+	ColorWhite  = "\033[37m"
+	ColorBold   = "\033[1m"
+)
+
+// Helper functions for colored output
+func printInfo(format string, args ...interface{}) {
+	fmt.Printf(ColorBlue+"[INFO]"+ColorReset+" "+format, args...)
+}
+
+func printSuccess(format string, args ...interface{}) {
+	fmt.Printf(ColorGreen+"[SUCCESS]"+ColorReset+" "+format, args...)
+}
+
+func printWarning(format string, args ...interface{}) {
+	fmt.Printf(ColorYellow+"[WARNING]"+ColorReset+" "+format, args...)
+}
+
+func printError(format string, args ...interface{}) {
+	fmt.Printf(ColorRed+"[ERROR]"+ColorReset+" "+format, args...)
+}
+
+func printCommand(command string) {
+	fmt.Printf(ColorCyan+"Generated command:"+ColorReset+"\n")
+	fmt.Printf(ColorBold+"%s"+ColorReset+"\n\n", command)
+}
+
+func printPrompt(prompt string) {
+	fmt.Printf(ColorYellow+prompt+ColorReset)
+}
+
 type ContainerInfo struct {
 	Config struct {
 		Image string   `json:"Image"`
@@ -51,37 +90,41 @@ func main() {
 
 	containerName := os.Args[1]
 	
-	fmt.Printf("Processing container: %s\n", containerName)
+	printInfo("Processing container: %s\n", containerName)
 	
 	containerInfo, err := getContainerInfo(containerName)
 	if err != nil {
-		log.Fatalf("Failed to get container info: %v", err)
+		printError("Failed to get container info: %v\n", err)
+		os.Exit(1)
 	}
 
 	imageName := containerInfo.Config.Image
-	fmt.Printf("Container image: %s\n", imageName)
+	printInfo("Container image: %s\n", imageName)
 
 	if err := stopAndRemoveContainer(containerName); err != nil {
-		log.Fatalf("Failed to stop/remove container: %v", err)
+		printError("Failed to stop/remove container: %v\n", err)
+		os.Exit(1)
 	}
 
 	if err := pullLatestImage(imageName); err != nil {
-		log.Fatalf("Failed to pull latest image: %v", err)
+		printError("Failed to pull latest image: %v\n", err)
+		os.Exit(1)
 	}
 
 	runCommand := generateRunCommand(containerInfo)
-	fmt.Printf("\nGenerated command:\n%s\n\n", runCommand)
+	printCommand(runCommand)
 	
 	if !confirmExecution() {
-		fmt.Println("Operation cancelled by user.")
+		printWarning("Operation cancelled by user.\n")
 		return
 	}
 	
 	if err := executeCommand(runCommand); err != nil {
-		log.Fatalf("Failed to run container: %v", err)
+		printError("Failed to run container: %v\n", err)
+		os.Exit(1)
 	}
 
-	fmt.Printf("Container %s has been successfully restarted with latest image\n", containerName)
+	printSuccess("Container %s has been successfully restarted with latest image\n", containerName)
 }
 
 func getContainerInfo(containerName string) (*ContainerInfo, error) {
@@ -104,12 +147,12 @@ func getContainerInfo(containerName string) (*ContainerInfo, error) {
 }
 
 func stopAndRemoveContainer(containerName string) error {
-	fmt.Printf("Stopping container %s...\n", containerName)
+	printInfo("Stopping container %s...\n", containerName)
 	if err := exec.Command("docker", "stop", containerName).Run(); err != nil {
 		return fmt.Errorf("failed to stop container: %v", err)
 	}
 
-	fmt.Printf("Removing container %s...\n", containerName)
+	printInfo("Removing container %s...\n", containerName)
 	if err := exec.Command("docker", "rm", containerName).Run(); err != nil {
 		return fmt.Errorf("failed to remove container: %v", err)
 	}
@@ -118,7 +161,7 @@ func stopAndRemoveContainer(containerName string) error {
 }
 
 func pullLatestImage(imageName string) error {
-	fmt.Printf("Pulling latest image %s...\n", imageName)
+	printInfo("Pulling latest image %s...\n", imageName)
 	cmd := exec.Command("docker", "pull", imageName)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -198,7 +241,7 @@ func shouldSkipEnv(env string) bool {
 
 func confirmExecution() bool {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Do you want to execute this command? (y/N): ")
+	printPrompt("Do you want to execute this command? (y/N): ")
 	
 	response, err := reader.ReadString('\n')
 	if err != nil {
