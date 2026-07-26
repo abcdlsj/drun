@@ -19,7 +19,22 @@ Updating a one-off Docker container usually means digging through `docker inspec
 
 ## Install
 
-Go 1.24 or later and a working Docker CLI are required.
+A working Docker CLI is required. Install the latest prebuilt binary on Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abcdlsj/drun/main/install.sh | sh
+```
+
+The installer supports Linux and macOS on `amd64` and `arm64`. It verifies the release checksum before installing to `/usr/local/bin`.
+
+Install a specific version or choose another directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abcdlsj/drun/main/install.sh | \
+  DRUN_VERSION=v0.1.0 DRUN_INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+With Go 1.24 or later, you can also install from source:
 
 ```bash
 go install github.com/abcdlsj/drun@latest
@@ -106,3 +121,14 @@ Regenerate the README animation with ImageMagick:
 ```bash
 ./scripts/generate-demo.sh
 ```
+
+## Release
+
+GitHub Actions publishes a release when a semantic version tag is pushed. The release contains checksum-verified archives for Linux and macOS on `amd64` and `arm64`.
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The tag version is embedded in the binary and shown by `drun --version`. CI runs automatically for pushes to `main` and for pull requests.
