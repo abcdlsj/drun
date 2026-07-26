@@ -68,7 +68,6 @@ func TestBuildRunArgsPreservesConfiguration(t *testing.T) {
 		"--publish-all",
 		"--read-only",
 		"--init",
-		"--shm-size", "67108864b",
 		"--network", "frontend",
 		"--network-alias", "api",
 		"--tmpfs", "/run:rw,noexec",
@@ -76,7 +75,7 @@ func TestBuildRunArgsPreservesConfiguration(t *testing.T) {
 		"nginx:latest", "--", "/app/server", "serve", "--message", "hello world; $HOME",
 	}
 
-	got := buildRunArgs(info)
+	got := buildRunArgs(info, nil)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildRunArgs() mismatch\n got: %#v\nwant: %#v", got, want)
 	}
@@ -87,7 +86,7 @@ func TestBuildRunArgsDoesNotDuplicateVolumeWithoutMode(t *testing.T) {
 	info.HostConfig.Binds = []string{"web-data:/srv/data"}
 	info.Mounts = []mountInfo{{Type: "volume", Name: "web-data", Destination: "/srv/data", RW: true}}
 
-	args := buildRunArgs(info)
+	args := buildRunArgs(info, nil)
 	volumeCount := 0
 	for _, argument := range args {
 		if argument == "web-data:/srv/data" {
@@ -107,7 +106,7 @@ func TestRefreshDryRunDoesNotMutateDocker(t *testing.T) {
 	if err := app.refresh(context.Background(), refreshOptions{containerName: "web", dryRun: true}); err != nil {
 		t.Fatalf("refresh() error = %v", err)
 	}
-	want := [][]string{{"inspect", "web"}}
+	want := [][]string{{"inspect", "web"}, {"image", "inspect", "sha256:old"}}
 	if !reflect.DeepEqual(docker.calls, want) {
 		t.Fatalf("docker calls = %#v, want %#v", docker.calls, want)
 	}
@@ -122,7 +121,12 @@ func TestRefreshCancellationLeavesContainerUntouched(t *testing.T) {
 	if !errors.Is(err, errCancelled) {
 		t.Fatalf("refresh() error = %v, want errCancelled", err)
 	}
-	want := [][]string{{"inspect", "web"}, {"pull", "nginx:latest"}}
+	want := [][]string{
+		{"inspect", "web"},
+		{"image", "inspect", "sha256:old"},
+		{"pull", "nginx:latest"},
+		{"image", "inspect", "nginx:latest"},
+	}
 	if !reflect.DeepEqual(docker.calls, want) {
 		t.Fatalf("docker calls = %#v, want %#v", docker.calls, want)
 	}
@@ -142,12 +146,14 @@ func TestRefreshReplacesContainerAndRemovesBackup(t *testing.T) {
 
 	wantPrefix := [][]string{
 		{"inspect", "web"},
+		{"image", "inspect", "sha256:old"},
 		{"pull", "nginx:latest"},
+		{"image", "inspect", "nginx:latest"},
 		{"stop", "web"},
 		{"rename", "web", "web-drun-backup-1234"},
 	}
-	if !reflect.DeepEqual(docker.calls[:4], wantPrefix) {
-		t.Fatalf("docker call prefix = %#v, want %#v", docker.calls[:4], wantPrefix)
+	if !reflect.DeepEqual(docker.calls[:6], wantPrefix) {
+		t.Fatalf("docker call prefix = %#v, want %#v", docker.calls[:6], wantPrefix)
 	}
 	if got := docker.calls[len(docker.calls)-2]; !reflect.DeepEqual(got, []string{"network", "connect", "--alias", "collector", "metrics", "web"}) {
 		t.Fatalf("network connect call = %#v", got)
@@ -187,6 +193,26 @@ func TestRefreshRollsBackWhenReplacementFails(t *testing.T) {
 	}
 }
 
+func TestRefreshRollsBackWhenReplacementUsesUnexpectedImage(t *testing.T) {
+	docker := &fakeDocker{inspectInfo: sampleContainerInfo(), replacementImageID: "sha256:unexpected"}
+	ui := &fakeTerminal{confirmed: true}
+	app := newApplication(docker, ui)
+	app.now = func() time.Time { return time.Unix(1234, 0) }
+
+	err := app.refresh(context.Background(), refreshOptions{containerName: "web", yes: true})
+	if err == nil || !strings.Contains(err.Error(), "original container restored") {
+		t.Fatalf("refresh() error = %v, want image verification rollback", err)
+	}
+	wantTail := [][]string{
+		{"rm", "-f", "web"},
+		{"rename", "web-drun-backup-1234", "web"},
+		{"start", "web"},
+	}
+	if got := docker.calls[len(docker.calls)-3:]; !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("rollback calls = %#v, want %#v", got, wantTail)
+	}
+}
+
 func TestRefreshRejectsAutoRemoveContainer(t *testing.T) {
 	info := sampleContainerInfo()
 	info.HostConfig.AutoRemove = true
@@ -197,13 +223,59 @@ func TestRefreshRejectsAutoRemoveContainer(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--rm") {
 		t.Fatalf("refresh() error = %v, want --rm safety error", err)
 	}
-	if len(docker.calls) != 1 {
-		t.Fatalf("docker calls = %#v, want inspect only", docker.calls)
+	if len(docker.calls) != 2 {
+		t.Fatalf("docker calls = %#v, want container and image inspect only", docker.calls)
+	}
+}
+
+func TestBuildRunArgsOmitsImageDefaults(t *testing.T) {
+	info := sampleContainerInfo()
+	info.Config.Env = []string{"PATH=/usr/bin", "APP_MODE=production"}
+	info.Config.Labels = map[string]string{
+		"org.opencontainers.image.version": "v1.0.0",
+		"managed-by":                       "compose",
+	}
+	info.Config.WorkingDir = "/app"
+	info.Config.Entrypoint = []string{"/app/server"}
+	info.Config.Cmd = []string{"serve"}
+	info.HostConfig.ShmSize = 64 * 1024 * 1024
+	defaults := containerConfig{
+		Env:        []string{"PATH=/usr/bin"},
+		Labels:     map[string]string{"org.opencontainers.image.version": "v1.0.0"},
+		WorkingDir: "/app",
+		Entrypoint: []string{"/app/server"},
+		Cmd:        []string{"serve"},
+	}
+
+	args := buildRunArgs(info, &defaults)
+	command := strings.Join(args, " ")
+	for _, unwanted := range []string{"PATH=/usr/bin", "org.opencontainers.image.version", "--workdir", "--entrypoint", "--shm-size", " serve"} {
+		if strings.Contains(command, unwanted) {
+			t.Fatalf("command contains image default %q: %s", unwanted, command)
+		}
+	}
+	if !strings.Contains(command, "--env APP_MODE=production") || !strings.Contains(command, "--label managed-by=compose") {
+		t.Fatalf("command dropped runtime overrides: %s", command)
+	}
+}
+
+func TestRefreshSkipsReplacementWhenImageIsCurrent(t *testing.T) {
+	docker := &fakeDocker{inspectInfo: sampleContainerInfo(), latestImageID: "sha256:old"}
+	ui := &fakeTerminal{confirmed: true}
+	app := newApplication(docker, ui)
+
+	if err := app.refresh(context.Background(), refreshOptions{containerName: "web"}); err != nil {
+		t.Fatalf("refresh() error = %v", err)
+	}
+	for _, call := range docker.calls {
+		if len(call) > 0 && (call[0] == "stop" || call[0] == "rename" || call[0] == "run") {
+			t.Fatalf("up-to-date container was mutated: %#v", docker.calls)
+		}
 	}
 }
 
 func sampleContainerInfo() *containerInfo {
-	info := &containerInfo{ID: "1234567890abcdef", Name: "/web"}
+	info := &containerInfo{ID: "1234567890abcdef", Image: "sha256:old", Name: "/web"}
 	info.Config.Image = "nginx:latest"
 	info.State.Running = true
 	info.State.Status = "running"
@@ -215,9 +287,12 @@ func sampleContainerInfo() *containerInfo {
 }
 
 type fakeDocker struct {
-	inspectInfo *containerInfo
-	calls       [][]string
-	failWhen    func([]string) error
+	inspectInfo        *containerInfo
+	latestImageID      string
+	replacementImageID string
+	calls              [][]string
+	failWhen           func([]string) error
+	replacementStarted bool
 }
 
 func (d *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
@@ -227,21 +302,57 @@ func (d *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if len(args) > 0 && args[0] == "run" {
+		d.replacementStarted = true
+	}
 	if len(args) > 0 && args[0] == "inspect" {
-		return json.Marshal([]*containerInfo{d.inspectInfo})
+		info := *d.inspectInfo
+		if d.replacementStarted {
+			info.Image = d.replacementID()
+		}
+		return json.Marshal([]containerInfo{info})
+	}
+	if len(args) > 2 && args[0] == "image" && args[1] == "inspect" {
+		id := d.inspectInfo.Image
+		if args[2] == d.inspectInfo.Config.Image {
+			id = d.latestID()
+		}
+		image := imageInfo{ID: id, Config: d.inspectInfo.Config}
+		return json.Marshal([]imageInfo{image})
 	}
 	return nil, nil
 }
 
-type fakeTerminal struct {
-	confirmed bool
+func (d *fakeDocker) latestID() string {
+	if d.latestImageID != "" {
+		return d.latestImageID
+	}
+	return "sha256:new"
 }
 
-func (*fakeTerminal) header()                                  {}
-func (*fakeTerminal) info(string)                              {}
-func (*fakeTerminal) warning(string)                           {}
-func (*fakeTerminal) success(string)                           {}
-func (*fakeTerminal) command([]string)                         {}
-func (*fakeTerminal) summary(*containerInfo)                   {}
+func (d *fakeDocker) replacementID() string {
+	if d.replacementImageID != "" {
+		return d.replacementImageID
+	}
+	return d.latestID()
+}
+
+type fakeTerminal struct {
+	confirmed      bool
+	nonInteractive bool
+}
+
+func (*fakeTerminal) header(string)                   {}
+func (*fakeTerminal) info(string)                     {}
+func (*fakeTerminal) warning(string)                  {}
+func (*fakeTerminal) success(string)                  {}
+func (*fakeTerminal) command([]string)                {}
+func (*fakeTerminal) summary(*containerInfo)          {}
+func (*fakeTerminal) updateAvailable(updateCandidate) {}
+func (*fakeTerminal) listUpdates([]updateCandidate)   {}
+func (ui *fakeTerminal) selectUpdates(updates []updateCandidate) ([]updateCandidate, error) {
+	return updates, nil
+}
+func (ui *fakeTerminal) isInteractive() bool                   { return !ui.nonInteractive }
 func (ui *fakeTerminal) confirm(string) (bool, error)          { return ui.confirmed, nil }
 func (*fakeTerminal) spin(_ string, action func() error) error { return action() }

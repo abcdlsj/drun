@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,12 +40,16 @@ func (dockerCLI) run(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 type terminal interface {
-	header()
+	header(string)
 	info(string)
 	warning(string)
 	success(string)
 	command([]string)
 	summary(*containerInfo)
+	updateAvailable(updateCandidate)
+	listUpdates([]updateCandidate)
+	selectUpdates([]updateCandidate) ([]updateCandidate, error)
+	isInteractive() bool
 	confirm(string) (bool, error)
 	spin(string, func() error) error
 }
@@ -61,17 +66,26 @@ type refreshOptions struct {
 	dryRun        bool
 }
 
+type checkOptions struct {
+	yes bool
+}
+
 func newApplication(docker commandRunner, ui terminal) *application {
 	return &application{docker: docker, ui: ui, now: time.Now}
 }
 
 func (a *application) refresh(ctx context.Context, options refreshOptions) error {
-	a.ui.header()
+	a.ui.header("safe container refresh")
 
 	var info *containerInfo
+	var currentImage *imageInfo
 	if err := a.ui.spin("Inspecting container configuration", func() error {
 		var err error
 		info, err = a.inspect(ctx, options.containerName)
+		if err != nil {
+			return err
+		}
+		currentImage, err = a.inspectImage(ctx, info.Image)
 		return err
 	}); err != nil {
 		return fmt.Errorf("inspect container: %w", err)
@@ -80,21 +94,34 @@ func (a *application) refresh(ctx context.Context, options refreshOptions) error
 		return errors.New("containers created with --rm cannot be replaced safely")
 	}
 
-	runArgs := buildRunArgs(info)
-	a.ui.summary(info)
-	a.ui.command(append([]string{"docker"}, runArgs...))
+	runArgs := buildRunArgs(info, &currentImage.Config)
 
 	if options.dryRun {
+		a.ui.summary(info)
+		a.ui.command(append([]string{"docker"}, runArgs...))
 		a.ui.info("Dry run complete; the container was not changed")
 		return nil
 	}
 
-	if err := a.ui.spin("Pulling the latest image", func() error {
-		_, err := a.docker.run(ctx, "pull", info.Config.Image)
+	var latestImage *imageInfo
+	if err := a.ui.spin("Checking the latest image", func() error {
+		if _, err := a.docker.run(ctx, "pull", info.Config.Image); err != nil {
+			return err
+		}
+		var err error
+		latestImage, err = a.inspectImage(ctx, info.Config.Image)
 		return err
 	}); err != nil {
 		return fmt.Errorf("pull image %q: %w", info.Config.Image, err)
 	}
+	if sameImageID(info.Image, latestImage.ID) {
+		a.ui.success(fmt.Sprintf("Container %s is already up to date (%s)", strings.TrimPrefix(info.Name, "/"), displayImageIdentity(currentImage)))
+		return nil
+	}
+
+	candidate := newUpdateCandidate(info, currentImage, latestImage)
+	a.ui.updateAvailable(candidate)
+	a.ui.command(append([]string{"docker"}, runArgs...))
 
 	if !options.yes {
 		confirmed, err := a.ui.confirm("Replace the container with this configuration?")
@@ -108,11 +135,11 @@ func (a *application) refresh(ctx context.Context, options refreshOptions) error
 	}
 
 	backupName := backupContainerName(strings.TrimPrefix(info.Name, "/"), a.now())
-	if err := a.replace(ctx, info, runArgs, backupName); err != nil {
+	if err := a.replace(ctx, info, runArgs, backupName, latestImage.ID); err != nil {
 		return err
 	}
 
-	a.ui.success(fmt.Sprintf("Container %s is running on the latest image", strings.TrimPrefix(info.Name, "/")))
+	a.ui.success(fmt.Sprintf("Container %s updated %s -> %s", strings.TrimPrefix(info.Name, "/"), candidate.CurrentVersion, candidate.LatestVersion))
 	return nil
 }
 
@@ -132,7 +159,26 @@ func (a *application) inspect(ctx context.Context, name string) (*containerInfo,
 	return &containers[0], nil
 }
 
-func (a *application) replace(ctx context.Context, info *containerInfo, runArgs []string, backupName string) error {
+func (a *application) inspectImage(ctx context.Context, reference string) (*imageInfo, error) {
+	if reference == "" {
+		return nil, errors.New("container image ID is empty")
+	}
+	output, err := a.docker.run(ctx, "image", "inspect", reference)
+	if err != nil {
+		return nil, err
+	}
+
+	var images []imageInfo
+	if err := json.Unmarshal(output, &images); err != nil {
+		return nil, fmt.Errorf("decode docker image inspect output: %w", err)
+	}
+	if len(images) == 0 {
+		return nil, errors.New("image not found")
+	}
+	return &images[0], nil
+}
+
+func (a *application) replace(ctx context.Context, info *containerInfo, runArgs []string, backupName, expectedImageID string) error {
 	name := strings.TrimPrefix(info.Name, "/")
 	if info.State.Running {
 		if err := a.ui.spin("Stopping the current container", func() error {
@@ -156,6 +202,13 @@ func (a *application) replace(ctx context.Context, info *containerInfo, runArgs 
 	replaceErr := a.ui.spin("Starting the replacement container", func() error {
 		if _, err := a.docker.run(ctx, runArgs...); err != nil {
 			return err
+		}
+		replacement, err := a.inspect(ctx, name)
+		if err != nil {
+			return fmt.Errorf("verify replacement: %w", err)
+		}
+		if !sameImageID(replacement.Image, expectedImageID) {
+			return fmt.Errorf("replacement uses image %s, expected %s", shortImageID(replacement.Image), shortImageID(expectedImageID))
 		}
 		return a.connectAdditionalNetworks(ctx, info)
 	})
@@ -223,7 +276,7 @@ func backupContainerName(name string, now time.Time) string {
 	return fmt.Sprintf("%s-drun-backup-%d", name, now.Unix())
 }
 
-func buildRunArgs(info *containerInfo) []string {
+func buildRunArgs(info *containerInfo, imageDefaults *containerConfig) []string {
 	name := strings.TrimPrefix(info.Name, "/")
 	args := []string{"run", "-d", "--name", name}
 
@@ -248,10 +301,10 @@ func buildRunArgs(info *containerInfo) []string {
 		}
 	}
 
-	for _, env := range info.Config.Env {
+	for _, env := range environmentOverrides(info.Config.Env, imageDefaults) {
 		args = append(args, "--env", env)
 	}
-	for _, label := range sortedKeys(info.Config.Labels) {
+	for _, label := range labelOverrides(info.Config.Labels, imageDefaults) {
 		args = append(args, "--label", label+"="+info.Config.Labels[label])
 	}
 	for _, capability := range info.HostConfig.CapAdd {
@@ -273,10 +326,10 @@ func buildRunArgs(info *containerInfo) []string {
 		args = append(args, "--group-add", group)
 	}
 
-	if info.Config.User != "" {
+	if info.Config.User != "" && (imageDefaults == nil || info.Config.User != imageDefaults.User) {
 		args = append(args, "--user", info.Config.User)
 	}
-	if info.Config.WorkingDir != "" {
+	if info.Config.WorkingDir != "" && (imageDefaults == nil || info.Config.WorkingDir != imageDefaults.WorkingDir) {
 		args = append(args, "--workdir", info.Config.WorkingDir)
 	}
 	if info.HostConfig.Privileged {
@@ -291,7 +344,7 @@ func buildRunArgs(info *containerInfo) []string {
 	if info.HostConfig.Init != nil && *info.HostConfig.Init {
 		args = append(args, "--init")
 	}
-	if info.HostConfig.ShmSize > 0 {
+	if info.HostConfig.ShmSize > 0 && info.HostConfig.ShmSize != 64*1024*1024 {
 		args = append(args, "--shm-size", strconv.FormatInt(info.HostConfig.ShmSize, 10)+"b")
 	}
 	if network := info.HostConfig.NetworkMode; network != "" && network != "default" {
@@ -310,15 +363,59 @@ func buildRunArgs(info *containerInfo) []string {
 		args = append(args, "--tmpfs", value)
 	}
 
-	if len(info.Config.Entrypoint) > 0 {
-		args = append(args, "--entrypoint", info.Config.Entrypoint[0])
+	entrypointOverridden := imageDefaults == nil || !slices.Equal(info.Config.Entrypoint, imageDefaults.Entrypoint)
+	commandOverridden := imageDefaults == nil || !slices.Equal(info.Config.Cmd, imageDefaults.Cmd)
+	if entrypointOverridden {
+		entrypoint := ""
+		if len(info.Config.Entrypoint) > 0 {
+			entrypoint = info.Config.Entrypoint[0]
+		}
+		args = append(args, "--entrypoint", entrypoint)
 	}
 	args = append(args, info.Config.Image)
-	if len(info.Config.Entrypoint) > 1 {
+	if entrypointOverridden && len(info.Config.Entrypoint) > 1 {
 		args = append(args, info.Config.Entrypoint[1:]...)
 	}
-	args = append(args, info.Config.Cmd...)
+	if entrypointOverridden || commandOverridden {
+		args = append(args, info.Config.Cmd...)
+	}
 	return args
+}
+
+func environmentOverrides(containerEnv []string, imageDefaults *containerConfig) []string {
+	if imageDefaults == nil {
+		return containerEnv
+	}
+	defaults := make(map[string]string, len(imageDefaults.Env))
+	for _, value := range imageDefaults.Env {
+		defaults[environmentKey(value)] = value
+	}
+	overrides := make([]string, 0, len(containerEnv))
+	for _, value := range containerEnv {
+		if defaultValue, ok := defaults[environmentKey(value)]; !ok || defaultValue != value {
+			overrides = append(overrides, value)
+		}
+	}
+	return overrides
+}
+
+func environmentKey(value string) string {
+	key, _, _ := strings.Cut(value, "=")
+	return key
+}
+
+func labelOverrides(containerLabels map[string]string, imageDefaults *containerConfig) []string {
+	labels := sortedKeys(containerLabels)
+	if imageDefaults == nil {
+		return labels
+	}
+	overrides := labels[:0]
+	for _, label := range labels {
+		if value, ok := imageDefaults.Labels[label]; !ok || value != containerLabels[label] {
+			overrides = append(overrides, label)
+		}
+	}
+	return overrides
 }
 
 func appendAnonymousVolumes(args []string, info *containerInfo) []string {

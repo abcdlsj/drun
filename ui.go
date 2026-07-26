@@ -28,6 +28,7 @@ type terminalUI struct {
 	out         io.Writer
 	err         io.Writer
 	interactive bool
+	width       int
 }
 
 func newTerminalUI(in io.Reader, out, errOut io.Writer, noColor bool) *terminalUI {
@@ -36,21 +37,29 @@ func newTerminalUI(in io.Reader, out, errOut io.Writer, noColor bool) *terminalU
 		inputTTY = term.IsTerminal(int(file.Fd()))
 	}
 	outputTTY := false
+	width := 96
 	if file, ok := out.(*os.File); ok {
 		outputTTY = term.IsTerminal(int(file.Fd()))
+		if terminalWidth, _, err := term.GetSize(int(file.Fd())); err == nil {
+			width = terminalWidth
+		}
 	}
 	interactive := inputTTY && outputTTY && !noColor && os.Getenv("NO_COLOR") == ""
-	return &terminalUI{in: in, out: out, err: errOut, interactive: interactive}
+	return &terminalUI{in: in, out: out, err: errOut, interactive: interactive, width: width}
 }
 
-func (ui *terminalUI) header() {
+func (ui *terminalUI) header(subtitleText string) {
 	if !ui.interactive {
-		fmt.Fprintln(ui.out, "drun - safe container refresh")
+		fmt.Fprintf(ui.out, "drun - %s\n", subtitleText)
 		return
 	}
 	brand := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("DRUN")
-	subtitle := lipgloss.NewStyle().Foreground(colorMuted).Render("safe container refresh")
+	subtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(subtitleText)
 	fmt.Fprintf(ui.out, "\n  %s  %s\n\n", brand, subtitle)
+}
+
+func (ui *terminalUI) isInteractive() bool {
+	return ui.interactive
 }
 
 func (ui *terminalUI) info(message string) {
@@ -95,6 +104,66 @@ func (ui *terminalUI) summary(info *containerInfo) {
 	fmt.Fprintf(ui.out, "  %s  %s\n  %s\n\n", title, status, image)
 }
 
+func (ui *terminalUI) updateAvailable(update updateCandidate) {
+	if !ui.interactive {
+		fmt.Fprintf(ui.out, "update available: %s %s -> %s\n", update.Name, update.CurrentVersion, update.LatestVersion)
+		return
+	}
+	name := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(update.Name)
+	status := lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("● update available")
+	change := lipgloss.NewStyle().Foreground(colorMuted).Render(update.CurrentVersion + " -> " + update.LatestVersion)
+	image := lipgloss.NewStyle().Foreground(colorMuted).Render(update.Image)
+	fmt.Fprintf(ui.out, "  %s  %s\n  %s\n  %s\n\n", name, status, image, change)
+}
+
+func (ui *terminalUI) listUpdates(updates []updateCandidate) {
+	if ui.interactive {
+		title := lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render(fmt.Sprintf("%d updates available", len(updates)))
+		fmt.Fprintf(ui.out, "  %s\n\n", title)
+		for _, update := range updates {
+			name := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(update.Name)
+			change := lipgloss.NewStyle().Foreground(colorCyan).Render(update.CurrentVersion + " -> " + update.LatestVersion)
+			image := lipgloss.NewStyle().Foreground(colorMuted).Render(update.Image)
+			fmt.Fprintf(ui.out, "  +  %s  %s\n     %s\n", name, change, image)
+		}
+		fmt.Fprintln(ui.out)
+		return
+	}
+	fmt.Fprintf(ui.out, "%d updates available\n", len(updates))
+	for _, update := range updates {
+		fmt.Fprintf(ui.out, "- %s: %s -> %s (%s)\n", update.Name, update.CurrentVersion, update.LatestVersion, update.Image)
+	}
+}
+
+func (ui *terminalUI) selectUpdates(updates []updateCandidate) ([]updateCandidate, error) {
+	if !ui.interactive {
+		return nil, errorsUnexpectedModel("update selector requires an interactive terminal")
+	}
+	program := tea.NewProgram(
+		newUpdateSelectorModel(updates),
+		tea.WithInput(ui.in),
+		tea.WithOutput(ui.out),
+	)
+	finalModel, err := program.Run()
+	if err != nil {
+		return nil, err
+	}
+	model, ok := finalModel.(updateSelectorModel)
+	if !ok {
+		return nil, errorsUnexpectedModel("update selector")
+	}
+	if model.cancelled {
+		return nil, nil
+	}
+	selected := make([]updateCandidate, 0, len(updates))
+	for index, update := range model.updates {
+		if model.selected[index] {
+			selected = append(selected, update)
+		}
+	}
+	return selected, nil
+}
+
 func (ui *terminalUI) command(args []string) {
 	command := shellCommand(args)
 	if !ui.interactive {
@@ -103,13 +172,14 @@ func (ui *terminalUI) command(args []string) {
 	}
 
 	label := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("replacement command")
+	commandWidth := min(92, max(36, ui.width-6))
 	body := lipgloss.NewStyle().
 		Foreground(colorText).
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderLeft(true).
 		BorderForeground(colorCyan).
 		PaddingLeft(2).
-		Width(92).
+		Width(commandWidth).
 		Render(command)
 	fmt.Fprintf(ui.out, "  %s\n%s\n\n", label, body)
 }
@@ -224,6 +294,108 @@ type confirmModel struct {
 	message   string
 	selection int
 	confirmed bool
+}
+
+type updateSelectorModel struct {
+	updates   []updateCandidate
+	selected  map[int]bool
+	cursor    int
+	maxRows   int
+	cancelled bool
+}
+
+func newUpdateSelectorModel(updates []updateCandidate) updateSelectorModel {
+	selected := make(map[int]bool, len(updates))
+	for index := range updates {
+		selected[index] = true
+	}
+	return updateSelectorModel{updates: updates, selected: selected, maxRows: 7}
+}
+
+func (m updateSelectorModel) Init() tea.Cmd {
+	return nil
+}
+
+func (m updateSelectorModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	switch message := message.(type) {
+	case tea.WindowSizeMsg:
+		rows := (message.Height - 8) / 3
+		if rows < 1 {
+			rows = 1
+		}
+		m.maxRows = rows
+	case tea.KeyMsg:
+		switch message.String() {
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.updates)-1 {
+				m.cursor++
+			}
+		case " ":
+			m.selected[m.cursor] = !m.selected[m.cursor]
+		case "a":
+			selectAll := false
+			for index := range m.updates {
+				if !m.selected[index] {
+					selectAll = true
+					break
+				}
+			}
+			for index := range m.updates {
+				m.selected[index] = selectAll
+			}
+		case "enter":
+			return m, tea.Quit
+		case "q", "esc", "ctrl+c":
+			m.cancelled = true
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m updateSelectorModel) View() string {
+	selectedCount := 0
+	for index := range m.updates {
+		if m.selected[index] {
+			selectedCount++
+		}
+	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorYellow).
+		Render(fmt.Sprintf("%d updates available · %d selected", len(m.updates), selectedCount))
+
+	start := 0
+	if m.cursor >= m.maxRows {
+		start = m.cursor - m.maxRows + 1
+	}
+	end := min(len(m.updates), start+m.maxRows)
+	var body strings.Builder
+	body.WriteString("  " + title + "\n\n")
+	for index := start; index < end; index++ {
+		update := m.updates[index]
+		cursor := " "
+		if index == m.cursor {
+			cursor = lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("›")
+		}
+		marker := lipgloss.NewStyle().Foreground(colorMuted).Render("○")
+		nameStyle := lipgloss.NewStyle().Foreground(colorMuted)
+		if m.selected[index] {
+			marker = lipgloss.NewStyle().Foreground(colorGreen).Render("●")
+			nameStyle = lipgloss.NewStyle().Bold(true).Foreground(colorText)
+		}
+		change := lipgloss.NewStyle().Foreground(colorCyan).Render(update.CurrentVersion + " -> " + update.LatestVersion)
+		image := lipgloss.NewStyle().Foreground(colorMuted).Render(update.Image)
+		fmt.Fprintf(&body, "  %s %s %s  %s\n      %s\n\n", cursor, marker, nameStyle.Render(update.Name), change, image)
+	}
+	if end < len(m.updates) {
+		fmt.Fprintf(&body, "  %s\n", lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("... %d more", len(m.updates)-end)))
+	}
+	hint := lipgloss.NewStyle().Foreground(colorMuted).Render("↑/↓ move · space toggle · a select all · enter update · q quit")
+	body.WriteString("  " + hint + "\n")
+	return body.String()
 }
 
 func newConfirmModel(message string) confirmModel {

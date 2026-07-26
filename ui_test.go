@@ -19,3 +19,13 @@ func TestParseFlags(t *testing.T) {
 		t.Fatalf("parseFlags() = %#v", options)
 	}
 }
+
+func TestParseCheckFlags(t *testing.T) {
+	options, err := parseFlags([]string{"check", "--yes"})
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v", err)
+	}
+	if options.command != "check" || !options.yes || options.containerName != "" {
+		t.Fatalf("parseFlags() = %#v", options)
+	}
+}
