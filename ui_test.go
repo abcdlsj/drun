@@ -29,3 +29,15 @@ func TestParseCheckFlags(t *testing.T) {
 		t.Fatalf("parseFlags() = %#v", options)
 	}
 }
+
+func TestParseFlagsHelpIsNotAnError(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"check", "--help"}} {
+		options, err := parseFlags(args)
+		if err != nil {
+			t.Fatalf("parseFlags(%q) error = %v", args, err)
+		}
+		if !options.showHelp {
+			t.Fatalf("parseFlags(%q) showHelp = false", args)
+		}
+	}
+}

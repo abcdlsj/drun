@@ -17,6 +17,7 @@ type cliOptions struct {
 	dryRun        bool
 	noColor       bool
 	showVersion   bool
+	showHelp      bool
 }
 
 func main() {
@@ -28,6 +29,9 @@ func main() {
 
 	if options.showVersion {
 		fmt.Printf("drun %s\n", version)
+		return
+	}
+	if options.showHelp {
 		return
 	}
 
@@ -65,6 +69,10 @@ func parseFlags(args []string) (cliOptions, error) {
 			flags.PrintDefaults()
 		}
 		if err := flags.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				options.showHelp = true
+				return options, nil
+			}
 			return options, err
 		}
 		if flags.NArg() != 0 {
@@ -88,6 +96,10 @@ func parseFlags(args []string) (cliOptions, error) {
 	}
 
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			options.showHelp = true
+			return options, nil
+		}
 		return options, err
 	}
 	if options.showVersion {
