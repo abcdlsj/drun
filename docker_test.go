@@ -112,6 +112,63 @@ func TestRefreshDryRunDoesNotMutateDocker(t *testing.T) {
 	}
 }
 
+func TestRefreshComposeDryRunPrintsComposeCommandWithoutMutation(t *testing.T) {
+	info := sampleComposeContainerInfo()
+	docker := &fakeDocker{inspectInfo: info}
+	ui := &recordingTerminal{fakeTerminal: fakeTerminal{confirmed: true}}
+	app := newApplication(docker, ui)
+
+	if err := app.refresh(context.Background(), refreshOptions{containerName: "demo-web-1", dryRun: true}); err != nil {
+		t.Fatalf("refresh() error = %v", err)
+	}
+	wantCalls := [][]string{{"inspect", "demo-web-1"}, {"image", "inspect", "sha256:old"}}
+	if !reflect.DeepEqual(docker.calls, wantCalls) {
+		t.Fatalf("docker calls = %#v, want %#v", docker.calls, wantCalls)
+	}
+	wantCommand := []string{
+		"docker", "compose", "--project-name", "demo",
+		"--project-directory", "/srv/demo",
+		"--file", "/srv/demo/compose.yml",
+		"--file", "/srv/demo/compose.prod.yml",
+		"--env-file", "/srv/demo/.env.prod",
+		"up", "--detach", "--no-deps", "--pull", "never", "--force-recreate", "web",
+	}
+	if len(ui.commands) != 1 || !reflect.DeepEqual(ui.commands[0], wantCommand) {
+		t.Fatalf("commands = %#v, want %#v", ui.commands, wantCommand)
+	}
+}
+
+func TestRefreshComposeContainerUsesComposeInsteadOfDockerRun(t *testing.T) {
+	info := sampleComposeContainerInfo()
+	docker := &fakeDocker{inspectInfo: info}
+	ui := &fakeTerminal{confirmed: true}
+	app := newApplication(docker, ui)
+
+	if err := app.refresh(context.Background(), refreshOptions{containerName: "demo-web-1", yes: true}); err != nil {
+		t.Fatalf("refresh() error = %v", err)
+	}
+	if got := countDockerCalls(docker.calls, "compose"); got != 1 {
+		t.Fatalf("compose calls = %d, want 1; calls: %#v", got, docker.calls)
+	}
+	for _, call := range docker.calls {
+		if len(call) > 0 && (call[0] == "run" || call[0] == "stop" || call[0] == "rename") {
+			t.Fatalf("Compose container used standalone replacement: %#v", docker.calls)
+		}
+	}
+}
+
+func TestRefreshRejectsIncompleteComposeMetadata(t *testing.T) {
+	info := sampleContainerInfo()
+	info.Config.Labels = map[string]string{composeProjectLabel: "demo"}
+	docker := &fakeDocker{inspectInfo: info}
+	app := newApplication(docker, &fakeTerminal{})
+
+	err := app.refresh(context.Background(), refreshOptions{containerName: "web", yes: true})
+	if err == nil || !strings.Contains(err.Error(), "incomplete Docker Compose metadata") {
+		t.Fatalf("refresh() error = %v, want incomplete metadata error", err)
+	}
+}
+
 func TestRefreshCancellationLeavesContainerUntouched(t *testing.T) {
 	docker := &fakeDocker{inspectInfo: sampleContainerInfo()}
 	ui := &fakeTerminal{confirmed: false}
@@ -286,6 +343,20 @@ func sampleContainerInfo() *containerInfo {
 	return info
 }
 
+func sampleComposeContainerInfo() *containerInfo {
+	info := sampleContainerInfo()
+	info.Name = "/demo-web-1"
+	info.Config.Labels = map[string]string{
+		composeProjectLabel:         "demo",
+		composeServiceLabel:         "web",
+		composeWorkingDirLabel:      "/srv/demo",
+		composeConfigFilesLabel:     "/srv/demo/compose.yml,/srv/demo/compose.prod.yml",
+		composeEnvironmentFileLabel: "/srv/demo/.env.prod",
+		composeOneoffLabel:          "False",
+	}
+	return info
+}
+
 type fakeDocker struct {
 	inspectInfo        *containerInfo
 	latestImageID      string
@@ -302,7 +373,7 @@ func (d *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if len(args) > 0 && args[0] == "run" {
+	if len(args) > 0 && (args[0] == "run" || args[0] == "compose") {
 		d.replacementStarted = true
 	}
 	if len(args) > 0 && args[0] == "inspect" {
@@ -356,3 +427,12 @@ func (ui *fakeTerminal) selectUpdates(updates []updateCandidate) ([]updateCandid
 func (ui *fakeTerminal) isInteractive() bool                   { return !ui.nonInteractive }
 func (ui *fakeTerminal) confirm(string) (bool, error)          { return ui.confirmed, nil }
 func (*fakeTerminal) spin(_ string, action func() error) error { return action() }
+
+type recordingTerminal struct {
+	fakeTerminal
+	commands [][]string
+}
+
+func (ui *recordingTerminal) command(args []string) {
+	ui.commands = append(ui.commands, append([]string(nil), args...))
+}

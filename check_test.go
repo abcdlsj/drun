@@ -43,6 +43,29 @@ func TestCheckDoesNotUpdateWithoutInteractiveTerminalOrYes(t *testing.T) {
 	}
 }
 
+func TestCheckUsesComposeForComposeManagedContainer(t *testing.T) {
+	docker := newCheckDocker()
+	docker.containers["web"].Config.Labels = sampleComposeContainerInfo().Config.Labels
+	ui := &fakeTerminal{}
+	app := newApplication(docker, ui)
+
+	if err := app.check(context.Background(), checkOptions{}); err != nil {
+		t.Fatalf("check() error = %v", err)
+	}
+	if got := countDockerCalls(docker.calls, "compose"); got != 1 {
+		t.Fatalf("compose calls = %d, want 1; calls: %#v", got, docker.calls)
+	}
+	for _, call := range docker.calls {
+		if len(call) > 0 && call[0] == "run" {
+			for index, argument := range call {
+				if argument == "--name" && index+1 < len(call) && call[index+1] == "web" {
+					t.Fatalf("Compose container web used docker run: %#v", docker.calls)
+				}
+			}
+		}
+	}
+}
+
 func TestDisplayImageVersionsPrefersTagsThenRevisionThenImageID(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -175,6 +198,12 @@ func (d *checkDocker) run(_ context.Context, args ...string) ([]byte, error) {
 			if argument == "--name" && index+1 < len(args) {
 				d.updated[args[index+1]] = true
 				break
+			}
+		}
+	case "compose":
+		for name, info := range d.containers {
+			if info.Config.Labels[composeProjectLabel] == "demo" && info.Config.Labels[composeServiceLabel] == "web" {
+				d.updated[name] = true
 			}
 		}
 	}

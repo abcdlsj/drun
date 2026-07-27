@@ -10,11 +10,13 @@ Safely refresh a Docker container with the latest image while preserving its run
 
 Updating a one-off Docker container usually means digging through `docker inspect`, rebuilding a long `docker run` command, and hoping nothing was missed. `drun` turns that into one command while keeping the old container available as a rollback point until the replacement is running.
 
+Containers managed by Docker Compose are detected automatically from their standard labels and recreated through `docker compose`; the CLI stays the same and preserves the complete Compose service configuration.
+
 - Pulls the latest version of the configured image
 - Compares immutable image IDs and skips containers that are already current
 - Shows the exact replacement command before changing the container
 - Preserves ports, volumes, environment variables, labels, restart policy, capabilities, networks, entrypoint, user, working directory, and common security options
-- Restores the original container automatically when replacement fails
+- Restores the original standalone container automatically when replacement fails
 - Uses a Bubble Tea interface with animated status, focused choices, and rich terminal styling
 - Supports non-interactive automation and plain-text output
 
@@ -98,13 +100,15 @@ Checking for updates pulls each unique image once, but it does not stop or repla
 1. Inspect the container and its current immutable image configuration.
 2. Pull the configured image and compare image IDs.
 3. Exit without touching the container when the image is already current.
-4. Reconstruct only container-level overrides and print the exact `docker run` command.
+4. Detect Docker Compose ownership, otherwise reconstruct only container-level overrides, and print the exact replacement command.
 5. Ask for confirmation unless `--yes` is set.
-6. Stop the current container and rename it to a temporary rollback name.
-7. Start the replacement, verify its image ID, and reconnect additional networks.
-8. Remove the rollback container only after every verification succeeds.
+6. For standalone containers, stop the current container and rename it to a temporary rollback name.
+7. Start the replacement (or delegate it to Compose), verify its image ID, and reconnect additional networks when needed.
+8. Remove the standalone rollback container only after every verification succeeds.
 
 If startup or network attachment fails, `drun` removes the partial replacement, restores the original name, and restarts the original container when it was previously running.
+
+For Docker Compose services, `drun` delegates recreation to `docker compose up --no-deps` using the project metadata attached to the container. Compose owns the replacement lifecycle in this path, so `drun` verifies the resulting image but cannot provide its standalone-container rollback mechanism.
 
 ## Configuration coverage
 

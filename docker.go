@@ -94,11 +94,20 @@ func (a *application) refresh(ctx context.Context, options refreshOptions) error
 		return errors.New("containers created with --rm cannot be replaced safely")
 	}
 
-	runArgs := buildRunArgs(info, &currentImage.Config)
+	compose, isCompose, err := composeServiceFromContainer(info)
+	if err != nil {
+		return err
+	}
+	var replacementArgs []string
+	if isCompose {
+		replacementArgs = compose.upArgs()
+	} else {
+		replacementArgs = buildRunArgs(info, &currentImage.Config)
+	}
 
 	if options.dryRun {
 		a.ui.summary(info)
-		a.ui.command(append([]string{"docker"}, runArgs...))
+		a.ui.command(append([]string{"docker"}, replacementArgs...))
 		a.ui.info("Dry run complete; the container was not changed")
 		return nil
 	}
@@ -121,7 +130,7 @@ func (a *application) refresh(ctx context.Context, options refreshOptions) error
 
 	candidate := newUpdateCandidate(info, currentImage, latestImage)
 	a.ui.updateAvailable(candidate)
-	a.ui.command(append([]string{"docker"}, runArgs...))
+	a.ui.command(append([]string{"docker"}, replacementArgs...))
 
 	if !options.yes {
 		confirmed, err := a.ui.confirm("Replace the container with this configuration?")
@@ -134,13 +143,36 @@ func (a *application) refresh(ctx context.Context, options refreshOptions) error
 		}
 	}
 
-	backupName := backupContainerName(strings.TrimPrefix(info.Name, "/"), a.now())
-	if err := a.replace(ctx, info, runArgs, backupName, latestImage.ID); err != nil {
-		return err
+	if isCompose {
+		if err := a.replaceCompose(ctx, info, replacementArgs, latestImage.ID); err != nil {
+			return err
+		}
+	} else {
+		backupName := backupContainerName(strings.TrimPrefix(info.Name, "/"), a.now())
+		if err := a.replace(ctx, info, replacementArgs, backupName, latestImage.ID); err != nil {
+			return err
+		}
 	}
 
 	a.ui.success(fmt.Sprintf("Container %s updated %s -> %s", strings.TrimPrefix(info.Name, "/"), candidate.CurrentVersion, candidate.LatestVersion))
 	return nil
+}
+
+func (a *application) replaceCompose(ctx context.Context, info *containerInfo, args []string, expectedImageID string) error {
+	name := strings.TrimPrefix(info.Name, "/")
+	return a.ui.spin("Recreating the Docker Compose service", func() error {
+		if _, err := a.docker.run(ctx, args...); err != nil {
+			return err
+		}
+		replacement, err := a.inspect(ctx, name)
+		if err != nil {
+			return fmt.Errorf("verify replacement: %w", err)
+		}
+		if !sameImageID(replacement.Image, expectedImageID) {
+			return fmt.Errorf("replacement uses image %s, expected %s", shortImageID(replacement.Image), shortImageID(expectedImageID))
+		}
+		return nil
+	})
 }
 
 func (a *application) inspect(ctx context.Context, name string) (*containerInfo, error) {

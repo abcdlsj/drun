@@ -125,7 +125,7 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 		a.ui.info(fmt.Sprintf("Updating %s (%d/%d)", candidate.Name, index+1, len(selected)))
 		if err := a.updateCheckedContainer(ctx, candidate); err != nil {
 			updateErrors = append(updateErrors, fmt.Errorf("update %s: %w", candidate.Name, err))
-			a.ui.warning(fmt.Sprintf("%s failed; the original container was restored when possible", candidate.Name))
+			a.ui.warning(fmt.Sprintf("%s failed; check the container state", candidate.Name))
 			continue
 		}
 		updated++
@@ -168,6 +168,13 @@ func (a *application) updateCheckedContainer(ctx context.Context, candidate upda
 	currentImage, err := a.inspectImage(ctx, info.Image)
 	if err != nil {
 		return err
+	}
+	compose, isCompose, err := composeServiceFromContainer(info)
+	if err != nil {
+		return err
+	}
+	if isCompose {
+		return a.replaceCompose(ctx, info, compose.upArgs(), candidate.LatestImageID)
 	}
 	runArgs := buildRunArgs(info, &currentImage.Config)
 	backupName := backupContainerName(candidate.Name, a.now())
