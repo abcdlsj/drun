@@ -84,13 +84,13 @@ func parseFlags(args []string) (cliOptions, error) {
 
 	flags := flag.NewFlagSet("drun", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	flags.BoolVar(&options.yes, "yes", false, "skip the confirmation prompt")
-	flags.BoolVar(&options.yes, "y", false, "skip the confirmation prompt")
+	flags.BoolVar(&options.yes, "yes", false, "skip confirmation or update every available container")
+	flags.BoolVar(&options.yes, "y", false, "skip confirmation or update every available container")
 	flags.BoolVar(&options.dryRun, "dry-run", false, "inspect and print the replacement command only")
 	flags.BoolVar(&options.noColor, "no-color", false, "disable colors and interactive rendering")
 	flags.BoolVar(&options.showVersion, "version", false, "print version information")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Usage: drun [options] <container_name>")
+		fmt.Fprintln(flags.Output(), "Usage: drun [options] [container_name]")
 		fmt.Fprintln(flags.Output(), "       drun check [options]")
 		flags.PrintDefaults()
 	}
@@ -105,9 +105,17 @@ func parseFlags(args []string) (cliOptions, error) {
 	if options.showVersion {
 		return options, nil
 	}
-	if flags.NArg() != 1 {
+	if flags.NArg() == 0 {
+		if options.dryRun {
+			flags.Usage()
+			return options, fmt.Errorf("--dry-run requires a container name")
+		}
+		options.command = "check"
+		return options, nil
+	}
+	if flags.NArg() > 1 {
 		flags.Usage()
-		return options, fmt.Errorf("exactly one container name is required")
+		return options, fmt.Errorf("at most one container name is accepted")
 	}
 
 	options.containerName = flags.Arg(0)

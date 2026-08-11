@@ -54,6 +54,7 @@ go build -o drun .
 ## Usage
 
 ```console
+$ drun [options]
 $ drun [options] <container_name>
 $ drun check [options]
 ```
@@ -61,6 +62,12 @@ $ drun check [options]
 Common workflows:
 
 ```bash
+# Find available updates and choose containers interactively
+drun
+
+# Update every container with an available image
+drun --yes
+
 # Preview the reconstructed command without pulling or changing anything
 drun --dry-run my-web-app
 
@@ -73,25 +80,22 @@ drun --yes my-web-app
 # Disable colors and animated rendering
 drun --no-color my-web-app
 
-# Find updates across every running container and choose what to update
+# The explicit check command remains available for compatibility
 drun check
-
-# Update every container with an available image in automation
-drun check --yes
 ```
 
 | Option | Description |
 | --- | --- |
 | `--dry-run` | Inspect and print the replacement command without making changes |
-| `-y`, `--yes` | Skip the confirmation prompt |
+| `-y`, `--yes` | Skip confirmation for one container, or update every available container when scanning |
 | `--no-color` | Disable color and interactive rendering |
 | `--version` | Print version information |
 
 Set the standard `NO_COLOR` environment variable to disable color as well.
 
-`drun check` supports `-y`/`--yes` and `--no-color`. In an interactive terminal every update is selected by default: use the arrow keys to move, Space to toggle an item, `a` to select or clear all, and Enter to update the selection.
+Running `drun` without a container scans every running container for updates. `drun check` is an equivalent compatibility command. In an interactive terminal every update is selected by default: use the arrow keys to move, Space to toggle an item, `a` to select or clear all, and Enter to update the selection.
 
-Checking for updates pulls each unique image once, but it does not stop or replace any container until the selection is confirmed. In non-interactive output, `drun check` only lists updates unless `--yes` is supplied.
+Checking for updates pulls each unique image once, but it does not stop or replace any container until the selection is confirmed. In non-interactive output, `drun` only lists updates unless `--yes` is supplied.
 
 ## Safe replacement
 
