@@ -8,7 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func TestShellCommandQuotesDisplayWithoutChangingArguments(t *testing.T) {
+func TestShellQuote(t *testing.T) {
 	args := []string{"docker", "run", "--env", "GREETING=hello world", "--env", "TOKEN=$(touch /tmp/nope)", "it's-safe"}
 	want := `docker run --env 'GREETING=hello world' --env 'TOKEN=$(touch /tmp/nope)' 'it'"'"'s-safe'`
 	if got := shellCommand(args); got != want {
@@ -16,7 +16,7 @@ func TestShellCommandQuotesDisplayWithoutChangingArguments(t *testing.T) {
 	}
 }
 
-func TestParseFlagsRoutesCommands(t *testing.T) {
+func TestFlagRouting(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
@@ -52,7 +52,7 @@ func TestParseFlagsRoutesCommands(t *testing.T) {
 	}
 }
 
-func TestParseFlagsHelpIsNotAnError(t *testing.T) {
+func TestHelpFlag(t *testing.T) {
 	for _, args := range [][]string{{"--help"}, {"check", "--help"}} {
 		options, err := parseFlags(args)
 		if err != nil {
@@ -64,7 +64,7 @@ func TestParseFlagsHelpIsNotAnError(t *testing.T) {
 	}
 }
 
-func TestSelectVersionPrefersReleaseInjectionThenModuleVersion(t *testing.T) {
+func TestVersionResolution(t *testing.T) {
 	tests := []struct {
 		injected string
 		module   string
@@ -81,7 +81,7 @@ func TestSelectVersionPrefersReleaseInjectionThenModuleVersion(t *testing.T) {
 	}
 }
 
-func TestUpdateAvailableUsesCompactTwoLineLayout(t *testing.T) {
+func TestUpdateRendering(t *testing.T) {
 	var output bytes.Buffer
 	ui := &terminalUI{out: &output, interactive: true, width: 96}
 	ui.updateAvailable(updateCandidate{
@@ -99,7 +99,7 @@ func TestUpdateAvailableUsesCompactTwoLineLayout(t *testing.T) {
 	}
 }
 
-func TestStatusMarkersRemainASCIIInPlainOutput(t *testing.T) {
+func TestPlainStatus(t *testing.T) {
 	var output bytes.Buffer
 	var errorOutput bytes.Buffer
 	ui := &terminalUI{out: &output, err: &errorOutput}
@@ -117,7 +117,7 @@ func TestStatusMarkersRemainASCIIInPlainOutput(t *testing.T) {
 	}
 }
 
-func TestConfirmationDefaultsToSafeActionAndRequiresSelectionToReplace(t *testing.T) {
+func TestConfirmDefault(t *testing.T) {
 	model := newConfirmModel("Replace?")
 	if model.selection != 1 {
 		t.Fatalf("default selection = %d, want Keep current", model.selection)

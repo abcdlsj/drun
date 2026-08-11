@@ -11,7 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func TestCheckPullsSharedImageOnceAndUpdatesEveryOutdatedContainer(t *testing.T) {
+func TestCheckSharedImage(t *testing.T) {
 	docker := newCheckDocker()
 	ui := &fakeTerminal{}
 	app := newApplication(docker, ui)
@@ -31,7 +31,7 @@ func TestCheckPullsSharedImageOnceAndUpdatesEveryOutdatedContainer(t *testing.T)
 	}
 }
 
-func TestCheckDoesNotUpdateWithoutInteractiveTerminalOrYes(t *testing.T) {
+func TestCheckNonInteractive(t *testing.T) {
 	docker := newCheckDocker()
 	ui := &fakeTerminal{nonInteractive: true}
 	app := newApplication(docker, ui)
@@ -44,7 +44,7 @@ func TestCheckDoesNotUpdateWithoutInteractiveTerminalOrYes(t *testing.T) {
 	}
 }
 
-func TestCheckYesUpdatesAllWithoutOpeningSelector(t *testing.T) {
+func TestCheckYes(t *testing.T) {
 	docker := newCheckDocker()
 	ui := &fakeTerminal{nonInteractive: true}
 	app := newApplication(docker, ui)
@@ -60,7 +60,7 @@ func TestCheckYesUpdatesAllWithoutOpeningSelector(t *testing.T) {
 	}
 }
 
-func TestUpdateCheckedContainerReportsAlreadyCurrentWithoutReplacing(t *testing.T) {
+func TestCheckedContainerCurrent(t *testing.T) {
 	info := sampleContainerInfo()
 	info.Image = "sha256:new"
 	docker := &fakeDocker{inspectInfo: info}
@@ -80,7 +80,7 @@ func TestUpdateCheckedContainerReportsAlreadyCurrentWithoutReplacing(t *testing.
 	}
 }
 
-func TestCheckLatestImagesUsesBoundedConcurrency(t *testing.T) {
+func TestImageCheckConcurrency(t *testing.T) {
 	docker := &parallelCheckDocker{
 		started: make(chan string, maxConcurrentImageChecks),
 		release: make(chan struct{}),
@@ -125,7 +125,7 @@ func TestCheckLatestImagesUsesBoundedConcurrency(t *testing.T) {
 	}
 }
 
-func TestCheckUsesComposeForComposeManagedContainer(t *testing.T) {
+func TestCheckCompose(t *testing.T) {
 	docker := newCheckDocker()
 	docker.containers["web"].Config.Labels = sampleComposeContainerInfo().Config.Labels
 	ui := &fakeTerminal{}
@@ -148,7 +148,7 @@ func TestCheckUsesComposeForComposeManagedContainer(t *testing.T) {
 	}
 }
 
-func TestDisplayImageVersionsPrefersTagsThenRevisionThenImageID(t *testing.T) {
+func TestImageVersions(t *testing.T) {
 	tests := []struct {
 		name        string
 		current     imageInfo
@@ -195,7 +195,7 @@ func TestDisplayImageVersionsPrefersTagsThenRevisionThenImageID(t *testing.T) {
 	}
 }
 
-func TestUpdateSelectorDefaultsToAllAndTogglesSelection(t *testing.T) {
+func TestUpdateSelection(t *testing.T) {
 	updates := []updateCandidate{{Name: "api"}, {Name: "web"}}
 	model := newUpdateSelectorModel(updates)
 	if !model.selected[0] || !model.selected[1] {

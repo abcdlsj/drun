@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestBuildRunArgsPreservesConfiguration(t *testing.T) {
+func TestRunArgs(t *testing.T) {
 	init := true
 	info := sampleContainerInfo()
 	info.Config.Cmd = []string{"serve", "--message", "hello world; $HOME"}
@@ -81,7 +81,7 @@ func TestBuildRunArgsPreservesConfiguration(t *testing.T) {
 	}
 }
 
-func TestBuildRunArgsDoesNotDuplicateVolumeWithoutMode(t *testing.T) {
+func TestRunArgsVolume(t *testing.T) {
 	info := sampleContainerInfo()
 	info.HostConfig.Binds = []string{"web-data:/srv/data"}
 	info.Mounts = []mountInfo{{Type: "volume", Name: "web-data", Destination: "/srv/data", RW: true}}
@@ -98,7 +98,7 @@ func TestBuildRunArgsDoesNotDuplicateVolumeWithoutMode(t *testing.T) {
 	}
 }
 
-func TestRefreshDryRunDoesNotMutateDocker(t *testing.T) {
+func TestDryRun(t *testing.T) {
 	docker := &fakeDocker{inspectInfo: sampleContainerInfo()}
 	ui := &fakeTerminal{confirmed: true}
 	app := newApplication(docker, ui)
@@ -112,7 +112,7 @@ func TestRefreshDryRunDoesNotMutateDocker(t *testing.T) {
 	}
 }
 
-func TestRefreshComposeDryRunPrintsComposeCommandWithoutMutation(t *testing.T) {
+func TestComposeDryRun(t *testing.T) {
 	info := sampleComposeContainerInfo()
 	docker := &fakeDocker{inspectInfo: info}
 	ui := &recordingTerminal{fakeTerminal: fakeTerminal{confirmed: true}}
@@ -138,7 +138,7 @@ func TestRefreshComposeDryRunPrintsComposeCommandWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestRefreshComposeContainerUsesComposeInsteadOfDockerRun(t *testing.T) {
+func TestComposeRefresh(t *testing.T) {
 	info := sampleComposeContainerInfo()
 	docker := &fakeDocker{inspectInfo: info}
 	ui := &fakeTerminal{confirmed: true}
@@ -157,7 +157,7 @@ func TestRefreshComposeContainerUsesComposeInsteadOfDockerRun(t *testing.T) {
 	}
 }
 
-func TestRefreshRejectsIncompleteComposeMetadata(t *testing.T) {
+func TestComposeMetadata(t *testing.T) {
 	info := sampleContainerInfo()
 	info.Config.Labels = map[string]string{composeProjectLabel: "demo"}
 	docker := &fakeDocker{inspectInfo: info}
@@ -169,7 +169,7 @@ func TestRefreshRejectsIncompleteComposeMetadata(t *testing.T) {
 	}
 }
 
-func TestRefreshCancellationLeavesContainerUntouched(t *testing.T) {
+func TestRefreshCancel(t *testing.T) {
 	docker := &fakeDocker{inspectInfo: sampleContainerInfo()}
 	ui := &fakeTerminal{confirmed: false}
 	app := newApplication(docker, ui)
@@ -189,7 +189,7 @@ func TestRefreshCancellationLeavesContainerUntouched(t *testing.T) {
 	}
 }
 
-func TestRefreshReplacesContainerAndRemovesBackup(t *testing.T) {
+func TestRefreshSuccess(t *testing.T) {
 	info := sampleContainerInfo()
 	info.NetworkSettings.Networks["metrics"] = networkInfo{Aliases: []string{"collector"}}
 	docker := &fakeDocker{inspectInfo: info}
@@ -220,7 +220,7 @@ func TestRefreshReplacesContainerAndRemovesBackup(t *testing.T) {
 	}
 }
 
-func TestRefreshRollsBackWhenReplacementFails(t *testing.T) {
+func TestRefreshRollback(t *testing.T) {
 	docker := &fakeDocker{
 		inspectInfo: sampleContainerInfo(),
 		failWhen: func(args []string) error {
@@ -250,7 +250,7 @@ func TestRefreshRollsBackWhenReplacementFails(t *testing.T) {
 	}
 }
 
-func TestRefreshRollsBackWhenReplacementUsesUnexpectedImage(t *testing.T) {
+func TestRefreshImageMismatch(t *testing.T) {
 	docker := &fakeDocker{inspectInfo: sampleContainerInfo(), replacementImageID: "sha256:unexpected"}
 	ui := &fakeTerminal{confirmed: true}
 	app := newApplication(docker, ui)
@@ -270,7 +270,7 @@ func TestRefreshRollsBackWhenReplacementUsesUnexpectedImage(t *testing.T) {
 	}
 }
 
-func TestRefreshRejectsAutoRemoveContainer(t *testing.T) {
+func TestRefreshAutoRemove(t *testing.T) {
 	info := sampleContainerInfo()
 	info.HostConfig.AutoRemove = true
 	docker := &fakeDocker{inspectInfo: info}
@@ -285,7 +285,7 @@ func TestRefreshRejectsAutoRemoveContainer(t *testing.T) {
 	}
 }
 
-func TestBuildRunArgsOmitsImageDefaults(t *testing.T) {
+func TestRunArgsDefaults(t *testing.T) {
 	info := sampleContainerInfo()
 	info.Config.Env = []string{"PATH=/usr/bin", "APP_MODE=production"}
 	info.Config.Labels = map[string]string{
@@ -316,7 +316,7 @@ func TestBuildRunArgsOmitsImageDefaults(t *testing.T) {
 	}
 }
 
-func TestRefreshSkipsReplacementWhenImageIsCurrent(t *testing.T) {
+func TestRefreshCurrentImage(t *testing.T) {
 	docker := &fakeDocker{inspectInfo: sampleContainerInfo(), latestImageID: "sha256:old"}
 	ui := &fakeTerminal{confirmed: true}
 	app := newApplication(docker, ui)
