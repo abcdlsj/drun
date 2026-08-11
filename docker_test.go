@@ -411,6 +411,7 @@ func (d *fakeDocker) replacementID() string {
 type fakeTerminal struct {
 	confirmed      bool
 	nonInteractive bool
+	selectCalls    int
 }
 
 func (*fakeTerminal) header(string)                   {}
@@ -422,6 +423,7 @@ func (*fakeTerminal) summary(*containerInfo)          {}
 func (*fakeTerminal) updateAvailable(updateCandidate) {}
 func (*fakeTerminal) listUpdates([]updateCandidate)   {}
 func (ui *fakeTerminal) selectUpdates(updates []updateCandidate) ([]updateCandidate, error) {
+	ui.selectCalls++
 	return updates, nil
 }
 func (ui *fakeTerminal) isInteractive() bool                   { return !ui.nonInteractive }

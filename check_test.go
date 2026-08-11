@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -40,6 +41,87 @@ func TestCheckDoesNotUpdateWithoutInteractiveTerminalOrYes(t *testing.T) {
 	}
 	if got := countDockerCalls(docker.calls, "stop"); got != 0 {
 		t.Fatalf("non-interactive check stopped containers: %#v", docker.calls)
+	}
+}
+
+func TestCheckYesUpdatesAllWithoutOpeningSelector(t *testing.T) {
+	docker := newCheckDocker()
+	ui := &fakeTerminal{nonInteractive: true}
+	app := newApplication(docker, ui)
+
+	if err := app.check(context.Background(), checkOptions{yes: true}); err != nil {
+		t.Fatalf("check() error = %v", err)
+	}
+	if ui.selectCalls != 0 {
+		t.Fatalf("selector opened %d times", ui.selectCalls)
+	}
+	if got := countDockerCalls(docker.calls, "stop"); got != 2 {
+		t.Fatalf("stop calls = %d, want 2; calls: %#v", got, docker.calls)
+	}
+}
+
+func TestUpdateCheckedContainerReportsAlreadyCurrentWithoutReplacing(t *testing.T) {
+	info := sampleContainerInfo()
+	info.Image = "sha256:new"
+	docker := &fakeDocker{inspectInfo: info}
+	app := newApplication(docker, &fakeTerminal{})
+
+	changed, err := app.updateCheckedContainer(context.Background(), updateCandidate{
+		Name: "web", CurrentImageID: "sha256:old", LatestImageID: "sha256:new",
+	})
+	if err != nil {
+		t.Fatalf("updateCheckedContainer() error = %v", err)
+	}
+	if changed {
+		t.Fatal("updateCheckedContainer() changed an already-current container")
+	}
+	if len(docker.calls) != 1 || docker.calls[0][0] != "inspect" {
+		t.Fatalf("already-current container was mutated: %#v", docker.calls)
+	}
+}
+
+func TestCheckLatestImagesUsesBoundedConcurrency(t *testing.T) {
+	docker := &parallelCheckDocker{
+		started: make(chan string, maxConcurrentImageChecks),
+		release: make(chan struct{}),
+	}
+	app := newApplication(docker, &fakeTerminal{})
+	references := []string{"example/a:latest", "example/b:latest", "example/c:latest", "example/d:latest", "example/e:latest"}
+
+	type result struct {
+		images map[string]*imageInfo
+		errors map[string]error
+	}
+	done := make(chan result, 1)
+	go func() {
+		images, imageErrors := app.checkLatestImages(context.Background(), references)
+		done <- result{images: images, errors: imageErrors}
+	}()
+
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(docker.release) }) }
+	defer release()
+	for range maxConcurrentImageChecks {
+		select {
+		case <-docker.started:
+		case <-time.After(time.Second):
+			t.Fatal("image pulls did not start concurrently")
+		}
+	}
+	select {
+	case <-docker.started:
+		t.Fatalf("more than %d image pulls started concurrently", maxConcurrentImageChecks)
+	case <-time.After(20 * time.Millisecond):
+	}
+	release()
+
+	select {
+	case got := <-done:
+		if len(got.images) != len(references) || len(got.errors) != 0 {
+			t.Fatalf("checkLatestImages() returned %d images and %d errors", len(got.images), len(got.errors))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent image check did not finish")
 	}
 }
 
@@ -134,11 +216,33 @@ func TestUpdateSelectorDefaultsToAllAndTogglesSelection(t *testing.T) {
 }
 
 type checkDocker struct {
+	mu         sync.Mutex
 	calls      [][]string
 	containers map[string]*containerInfo
 	images     map[string]imageInfo
 	latest     imageInfo
 	updated    map[string]bool
+}
+
+type parallelCheckDocker struct {
+	started chan string
+	release chan struct{}
+}
+
+func (d *parallelCheckDocker) run(ctx context.Context, args ...string) ([]byte, error) {
+	if len(args) > 0 && args[0] == "pull" {
+		d.started <- args[1]
+		select {
+		case <-d.release:
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if len(args) > 2 && args[0] == "image" && args[1] == "inspect" {
+		return json.Marshal([]imageInfo{{ID: "sha256:" + args[2]}})
+	}
+	return nil, nil
 }
 
 func newCheckDocker() *checkDocker {
@@ -166,6 +270,8 @@ func newCheckDocker() *checkDocker {
 }
 
 func (d *checkDocker) run(_ context.Context, args ...string) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.calls = append(d.calls, append([]string(nil), args...))
 	if len(args) == 0 {
 		return nil, nil
@@ -213,7 +319,7 @@ func (d *checkDocker) run(_ context.Context, args ...string) ([]byte, error) {
 func countDockerCalls(calls [][]string, command string) int {
 	count := 0
 	for _, call := range calls {
-		if len(call) > 0 && reflect.DeepEqual(call[0], command) {
+		if len(call) > 0 && call[0] == command {
 			count++
 		}
 	}

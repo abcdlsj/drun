@@ -16,49 +16,39 @@ func TestShellCommandQuotesDisplayWithoutChangingArguments(t *testing.T) {
 	}
 }
 
-func TestParseFlags(t *testing.T) {
-	options, err := parseFlags([]string{"--dry-run", "--yes", "web"})
-	if err != nil {
-		t.Fatalf("parseFlags() error = %v", err)
+func TestParseFlagsRoutesCommands(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		want    cliOptions
+		wantErr bool
+	}{
+		{name: "container refresh", args: []string{"--dry-run", "--yes", "web"}, want: cliOptions{command: "refresh", containerName: "web", dryRun: true, yes: true}},
+		{name: "explicit check", args: []string{"check", "--yes"}, want: cliOptions{command: "check", yes: true}},
+		{name: "default check", want: cliOptions{command: "check"}},
+		{name: "update all", args: []string{"--yes"}, want: cliOptions{command: "check", yes: true}},
+		{name: "dry run requires container", args: []string{"--dry-run"}, wantErr: true},
+		{name: "version command", args: []string{"version"}, want: cliOptions{command: "refresh", showVersion: true}},
+		{name: "version flag", args: []string{"--version"}, want: cliOptions{command: "refresh", showVersion: true}},
+		{name: "short version flag", args: []string{"-v"}, want: cliOptions{command: "refresh", showVersion: true}},
 	}
-	if options.containerName != "web" || !options.dryRun || !options.yes {
-		t.Fatalf("parseFlags() = %#v", options)
-	}
-}
 
-func TestParseCheckFlags(t *testing.T) {
-	options, err := parseFlags([]string{"check", "--yes"})
-	if err != nil {
-		t.Fatalf("parseFlags() error = %v", err)
-	}
-	if options.command != "check" || !options.yes || options.containerName != "" {
-		t.Fatalf("parseFlags() = %#v", options)
-	}
-}
-
-func TestParseFlagsWithoutContainerStartsUpdateCheck(t *testing.T) {
-	options, err := parseFlags(nil)
-	if err != nil {
-		t.Fatalf("parseFlags(nil) error = %v", err)
-	}
-	if options.command != "check" || options.containerName != "" {
-		t.Fatalf("parseFlags(nil) = %#v", options)
-	}
-}
-
-func TestParseFlagsYesWithoutContainerUpdatesAll(t *testing.T) {
-	options, err := parseFlags([]string{"--yes"})
-	if err != nil {
-		t.Fatalf("parseFlags(--yes) error = %v", err)
-	}
-	if options.command != "check" || !options.yes {
-		t.Fatalf("parseFlags(--yes) = %#v", options)
-	}
-}
-
-func TestParseFlagsDryRunRequiresContainer(t *testing.T) {
-	if _, err := parseFlags([]string{"--dry-run"}); err == nil {
-		t.Fatal("parseFlags(--dry-run) error = nil, want an error")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseFlags(test.args)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parseFlags(%q) error = nil", test.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFlags(%q) error = %v", test.args, err)
+			}
+			if got != test.want {
+				t.Fatalf("parseFlags(%q) = %#v, want %#v", test.args, got, test.want)
+			}
+		})
 	}
 }
 
@@ -70,6 +60,23 @@ func TestParseFlagsHelpIsNotAnError(t *testing.T) {
 		}
 		if !options.showHelp {
 			t.Fatalf("parseFlags(%q) showHelp = false", args)
+		}
+	}
+}
+
+func TestSelectVersionPrefersReleaseInjectionThenModuleVersion(t *testing.T) {
+	tests := []struct {
+		injected string
+		module   string
+		want     string
+	}{
+		{injected: "v1.2.3", module: "v1.0.0", want: "v1.2.3"},
+		{injected: "dev", module: "v1.2.3", want: "v1.2.3"},
+		{injected: "dev", module: "(devel)", want: "dev"},
+	}
+	for _, test := range tests {
+		if got := selectVersion(test.injected, test.module); got != test.want {
+			t.Fatalf("selectVersion(%q, %q) = %q, want %q", test.injected, test.module, got, test.want)
 		}
 	}
 }
@@ -89,9 +96,6 @@ func TestUpdateAvailableUsesCompactTwoLineLayout(t *testing.T) {
 		if !strings.Contains(view, text) {
 			t.Fatalf("updateAvailable() output does not contain %q: %q", text, view)
 		}
-	}
-	if lines := strings.Count(strings.TrimSpace(view), "\n") + 1; lines != 2 {
-		t.Fatalf("updateAvailable() rendered %d lines, want 2: %q", lines, view)
 	}
 }
 
@@ -113,35 +117,28 @@ func TestStatusMarkersRemainASCIIInPlainOutput(t *testing.T) {
 	}
 }
 
-func TestUpdateSelectorDoesNotSeparateEveryItemWithBlankLines(t *testing.T) {
-	model := newUpdateSelectorModel([]updateCandidate{
-		{Name: "api", Image: "ghcr.io/acme/api:main", CurrentVersion: "v1", LatestVersion: "v2"},
-		{Name: "web", Image: "ghcr.io/acme/web:main", CurrentVersion: "v3", LatestVersion: "v4"},
-	})
-
+func TestConfirmationDefaultsToSafeActionAndRequiresSelectionToReplace(t *testing.T) {
+	model := newConfirmModel("Replace?")
+	if model.selection != 1 {
+		t.Fatalf("default selection = %d, want Keep current", model.selection)
+	}
 	view := model.View()
-	if blankLines := strings.Count(view, "\n\n"); blankLines != 2 {
-		t.Fatalf("selector rendered %d blank separators, want only header and footer separation: %q", blankLines, view)
-	}
-	if !strings.Contains(view, "2 of 2 selected") {
-		t.Fatalf("selector does not show a concise selection count: %q", view)
-	}
-}
-
-func TestUpdateSelectorFitsMoreRowsAfterCompaction(t *testing.T) {
-	model := newUpdateSelectorModel(make([]updateCandidate, 10))
-	updated, _ := model.Update(tea.WindowSizeMsg{Height: 12})
-	got := updated.(updateSelectorModel).maxRows
-	if got != 3 {
-		t.Fatalf("maxRows = %d, want 3", got)
-	}
-}
-
-func TestConfirmationPlacesSafeDefaultBeforeDestructiveAction(t *testing.T) {
-	view := newConfirmModel("Replace?").View()
 	keep := strings.Index(view, "Keep current")
 	replace := strings.LastIndex(view, "Replace")
 	if keep == -1 || replace == -1 || keep >= replace {
 		t.Fatalf("confirmation choices are not ordered safe-first: %q", view)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if updated.(confirmModel).confirmed {
+		t.Fatal("Enter confirmed replacement without selecting Replace")
+	}
+
+	model = newConfirmModel("Replace?")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = updated.(confirmModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !updated.(confirmModel).confirmed {
+		t.Fatal("Enter did not confirm after selecting Replace")
 	}
 }

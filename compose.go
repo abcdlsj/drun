@@ -44,7 +44,7 @@ func composeServiceFromContainer(info *containerInfo) (*composeService, bool, er
 		environmentFiles: splitComposeLabelList(labels[composeEnvironmentFileLabel]),
 	}
 	if compose.workingDir == "" && len(compose.configFiles) == 0 {
-		return nil, true, fmt.Errorf("Docker Compose metadata is missing both the project directory and config files")
+		return nil, true, fmt.Errorf("compose metadata is missing both the project directory and config files")
 	}
 	return compose, true, nil
 }

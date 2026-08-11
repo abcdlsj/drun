@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const maxConcurrentImageChecks = 4
+
 type containerSnapshot struct {
 	info  *containerInfo
 	image *imageInfo
@@ -59,27 +61,30 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 		a.ui.warning(warning)
 	}
 
-	latestImages := make(map[string]*imageInfo)
 	imageReferences := make(map[string]bool)
 	for _, snapshot := range snapshots {
 		imageReferences[snapshot.info.Config.Image] = true
 	}
-	for _, reference := range sortedKeys(imageReferences) {
-		var latest *imageInfo
-		err := a.ui.spin("Checking "+reference, func() error {
-			if _, pullErr := a.docker.run(ctx, "pull", reference); pullErr != nil {
-				return pullErr
-			}
-			var inspectErr error
-			latest, inspectErr = a.inspectImage(ctx, reference)
-			return inspectErr
-		})
-		if err != nil {
+	references := sortedKeys(imageReferences)
+	latestImages := make(map[string]*imageInfo, len(references))
+	imageErrors := make(map[string]error)
+	if len(references) > 0 {
+		checkMessage := fmt.Sprintf("Checking %d images", len(references))
+		if len(references) == 1 {
+			checkMessage = "Checking " + references[0]
+		}
+		if err := a.ui.spin(checkMessage, func() error {
+			latestImages, imageErrors = a.checkLatestImages(ctx, references)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	for _, reference := range references {
+		if err := imageErrors[reference]; err != nil {
 			checkErrors = append(checkErrors, fmt.Errorf("check image %s: %w", reference, err))
 			a.ui.warning(fmt.Sprintf("Could not check %s", reference))
-			continue
 		}
-		latestImages[reference] = latest
 	}
 
 	updates := make([]updateCandidate, 0)
@@ -120,24 +125,81 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	}
 
 	updated := 0
+	alreadyCurrent := 0
 	var updateErrors []error
 	for index, candidate := range selected {
 		a.ui.info(fmt.Sprintf("Updating %s (%d/%d)", candidate.Name, index+1, len(selected)))
-		if err := a.updateCheckedContainer(ctx, candidate); err != nil {
+		changed, err := a.updateCheckedContainer(ctx, candidate)
+		if err != nil {
 			updateErrors = append(updateErrors, fmt.Errorf("update %s: %w", candidate.Name, err))
 			a.ui.warning(fmt.Sprintf("%s failed; check the container state", candidate.Name))
+			continue
+		}
+		if !changed {
+			alreadyCurrent++
+			a.ui.info(candidate.Name + " was already updated")
 			continue
 		}
 		updated++
 		a.ui.success(fmt.Sprintf("%s updated %s -> %s", candidate.Name, candidate.CurrentVersion, candidate.LatestVersion))
 	}
 
-	if updated == len(selected) {
+	switch {
+	case updated == len(selected):
 		a.ui.success(fmt.Sprintf("Updated all %d selected containers", updated))
-	} else {
+	case alreadyCurrent == len(selected):
+		a.ui.success(fmt.Sprintf("All %d selected containers were already current", alreadyCurrent))
+	case updated+alreadyCurrent == len(selected):
+		a.ui.success(fmt.Sprintf("Updated %d containers; %d were already current", updated, alreadyCurrent))
+	default:
 		a.ui.warning(fmt.Sprintf("Updated %d of %d selected containers", updated, len(selected)))
 	}
 	return errors.Join(append(checkErrors, updateErrors...)...)
+}
+
+type imageCheckResult struct {
+	reference string
+	image     *imageInfo
+	err       error
+}
+
+func (a *application) checkLatestImages(ctx context.Context, references []string) (map[string]*imageInfo, map[string]error) {
+	latestImages := make(map[string]*imageInfo, len(references))
+	imageErrors := make(map[string]error)
+	if len(references) == 0 {
+		return latestImages, imageErrors
+	}
+
+	jobs := make(chan string, len(references))
+	results := make(chan imageCheckResult, len(references))
+	for _, reference := range references {
+		jobs <- reference
+	}
+	close(jobs)
+
+	workerCount := min(maxConcurrentImageChecks, len(references))
+	for range workerCount {
+		go func() {
+			for reference := range jobs {
+				if _, err := a.docker.run(ctx, "pull", reference); err != nil {
+					results <- imageCheckResult{reference: reference, err: err}
+					continue
+				}
+				image, err := a.inspectImage(ctx, reference)
+				results <- imageCheckResult{reference: reference, image: image, err: err}
+			}
+		}()
+	}
+
+	for range references {
+		result := <-results
+		if result.err != nil {
+			imageErrors[result.reference] = result.err
+			continue
+		}
+		latestImages[result.reference] = result.image
+	}
+	return latestImages, imageErrors
 }
 
 func (a *application) listRunningContainers(ctx context.Context) ([]string, error) {
@@ -150,35 +212,34 @@ func (a *application) listRunningContainers(ctx context.Context) ([]string, erro
 	return names, nil
 }
 
-func (a *application) updateCheckedContainer(ctx context.Context, candidate updateCandidate) error {
+func (a *application) updateCheckedContainer(ctx context.Context, candidate updateCandidate) (bool, error) {
 	info, err := a.inspect(ctx, candidate.Name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !info.State.Running {
-		return errors.New("container is no longer running")
+		return false, errors.New("container is no longer running")
 	}
 	if sameImageID(info.Image, candidate.LatestImageID) {
-		a.ui.info(candidate.Name + " was already updated")
-		return nil
+		return false, nil
 	}
 	if !sameImageID(info.Image, candidate.CurrentImageID) {
-		return fmt.Errorf("container image changed during selection (%s -> %s)", shortImageID(candidate.CurrentImageID), shortImageID(info.Image))
+		return false, fmt.Errorf("container image changed during selection (%s -> %s)", shortImageID(candidate.CurrentImageID), shortImageID(info.Image))
 	}
 	currentImage, err := a.inspectImage(ctx, info.Image)
 	if err != nil {
-		return err
+		return false, err
 	}
 	compose, isCompose, err := composeServiceFromContainer(info)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if isCompose {
-		return a.replaceCompose(ctx, info, compose.upArgs(), candidate.LatestImageID)
+		return true, a.replaceCompose(ctx, info, compose.upArgs(), candidate.LatestImageID)
 	}
 	runArgs := buildRunArgs(info, &currentImage.Config)
 	backupName := backupContainerName(candidate.Name, a.now())
-	return a.replace(ctx, info, runArgs, backupName, candidate.LatestImageID)
+	return true, a.replace(ctx, info, runArgs, backupName, candidate.LatestImageID)
 }
 
 func newUpdateCandidate(info *containerInfo, current, latest *imageInfo) updateCandidate {

@@ -57,6 +57,7 @@ go build -o drun .
 $ drun [options]
 $ drun [options] <container_name>
 $ drun check [options]
+$ drun version
 ```
 
 Common workflows:
@@ -89,7 +90,7 @@ drun check
 | `--dry-run` | Inspect and print the replacement command without making changes |
 | `-y`, `--yes` | Skip confirmation for one container, or update every available container when scanning |
 | `--no-color` | Disable color and interactive rendering |
-| `--version` | Print version information |
+| `-v`, `--version` | Print version information |
 
 Set the standard `NO_COLOR` environment variable to disable color as well.
 
@@ -153,4 +154,4 @@ git tag -a v0.2.0 -m "v0.2.0"
 git push origin v0.2.0
 ```
 
-The tag version is embedded in the binary and shown by `drun --version`. CI runs automatically for pushes to `main` and for pull requests.
+The tag version is embedded in release binaries. Builds installed with `go install` use the Go module version. Run `drun version`, `drun -v`, or `drun --version` to print it. CI runs automatically for pushes to `main` and for pull requests.

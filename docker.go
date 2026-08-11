@@ -311,7 +311,13 @@ func backupContainerName(name string, now time.Time) string {
 func buildRunArgs(info *containerInfo, imageDefaults *containerConfig) []string {
 	name := strings.TrimPrefix(info.Name, "/")
 	args := []string{"run", "-d", "--name", name}
+	args = appendContainerResources(args, info)
+	args = appendContainerConfiguration(args, info, imageDefaults)
+	args = appendContainerNetworking(args, info)
+	return appendContainerProcess(args, info, imageDefaults)
+}
 
+func appendContainerResources(args []string, info *containerInfo) []string {
 	if policy := restartPolicyArg(info.HostConfig.RestartPolicy); policy != "" {
 		args = append(args, "--restart", policy)
 	}
@@ -332,7 +338,10 @@ func buildRunArgs(info *containerInfo, imageDefaults *containerConfig) []string 
 			}
 		}
 	}
+	return args
+}
 
+func appendContainerConfiguration(args []string, info *containerInfo, imageDefaults *containerConfig) []string {
 	for _, env := range environmentOverrides(info.Config.Env, imageDefaults) {
 		args = append(args, "--env", env)
 	}
@@ -379,6 +388,10 @@ func buildRunArgs(info *containerInfo, imageDefaults *containerConfig) []string 
 	if info.HostConfig.ShmSize > 0 && info.HostConfig.ShmSize != 64*1024*1024 {
 		args = append(args, "--shm-size", strconv.FormatInt(info.HostConfig.ShmSize, 10)+"b")
 	}
+	return args
+}
+
+func appendContainerNetworking(args []string, info *containerInfo) []string {
 	if network := info.HostConfig.NetworkMode; network != "" && network != "default" {
 		args = append(args, "--network", network)
 		if primaryNetwork(network) != "" {
@@ -394,7 +407,10 @@ func buildRunArgs(info *containerInfo, imageDefaults *containerConfig) []string 
 		}
 		args = append(args, "--tmpfs", value)
 	}
+	return args
+}
 
+func appendContainerProcess(args []string, info *containerInfo, imageDefaults *containerConfig) []string {
 	entrypointOverridden := imageDefaults == nil || !slices.Equal(info.Config.Entrypoint, imageDefaults.Entrypoint)
 	commandOverridden := imageDefaults == nil || !slices.Equal(info.Config.Cmd, imageDefaults.Cmd)
 	if entrypointOverridden {

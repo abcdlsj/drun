@@ -299,14 +299,14 @@ type confirmModel struct {
 
 type updateSelectorModel struct {
 	updates   []updateCandidate
-	selected  map[int]bool
+	selected  []bool
 	cursor    int
 	maxRows   int
 	cancelled bool
 }
 
 func newUpdateSelectorModel(updates []updateCandidate) updateSelectorModel {
-	selected := make(map[int]bool, len(updates))
+	selected := make([]bool, len(updates))
 	for index := range updates {
 		selected[index] = true
 	}
@@ -336,7 +336,9 @@ func (m updateSelectorModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			}
 		case " ":
-			m.selected[m.cursor] = !m.selected[m.cursor]
+			if len(m.selected) > 0 {
+				m.selected[m.cursor] = !m.selected[m.cursor]
+			}
 		case "a":
 			selectAll := false
 			for index := range m.updates {

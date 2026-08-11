@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
+	"strings"
 )
 
 var version = "dev"
@@ -28,7 +30,7 @@ func main() {
 	}
 
 	if options.showVersion {
-		fmt.Printf("drun %s\n", version)
+		fmt.Printf("drun %s\n", currentVersion())
 		return
 	}
 	if options.showHelp {
@@ -57,13 +59,18 @@ func main() {
 
 func parseFlags(args []string) (cliOptions, error) {
 	options := cliOptions{command: "refresh"}
+	if len(args) > 0 && args[0] == "version" {
+		if len(args) != 1 {
+			return options, fmt.Errorf("drun version does not accept arguments")
+		}
+		options.showVersion = true
+		return options, nil
+	}
 	if len(args) > 0 && args[0] == "check" {
 		options.command = "check"
 		flags := flag.NewFlagSet("drun check", flag.ContinueOnError)
 		flags.SetOutput(os.Stderr)
-		flags.BoolVar(&options.yes, "yes", false, "update every container with an available image")
-		flags.BoolVar(&options.yes, "y", false, "update every container with an available image")
-		flags.BoolVar(&options.noColor, "no-color", false, "disable colors and interactive rendering")
+		addSharedFlags(flags, &options, "update every container with an available image")
 		flags.Usage = func() {
 			fmt.Fprintln(flags.Output(), "Usage: drun check [options]")
 			flags.PrintDefaults()
@@ -84,14 +91,14 @@ func parseFlags(args []string) (cliOptions, error) {
 
 	flags := flag.NewFlagSet("drun", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	flags.BoolVar(&options.yes, "yes", false, "skip confirmation or update every available container")
-	flags.BoolVar(&options.yes, "y", false, "skip confirmation or update every available container")
+	addSharedFlags(flags, &options, "skip confirmation or update every available container")
 	flags.BoolVar(&options.dryRun, "dry-run", false, "inspect and print the replacement command only")
-	flags.BoolVar(&options.noColor, "no-color", false, "disable colors and interactive rendering")
 	flags.BoolVar(&options.showVersion, "version", false, "print version information")
+	flags.BoolVar(&options.showVersion, "v", false, "print version information")
 	flags.Usage = func() {
 		fmt.Fprintln(flags.Output(), "Usage: drun [options] [container_name]")
 		fmt.Fprintln(flags.Output(), "       drun check [options]")
+		fmt.Fprintln(flags.Output(), "       drun version")
 		flags.PrintDefaults()
 	}
 
@@ -120,4 +127,28 @@ func parseFlags(args []string) (cliOptions, error) {
 
 	options.containerName = flags.Arg(0)
 	return options, nil
+}
+
+func addSharedFlags(flags *flag.FlagSet, options *cliOptions, yesUsage string) {
+	flags.BoolVar(&options.yes, "yes", false, yesUsage)
+	flags.BoolVar(&options.yes, "y", false, yesUsage)
+	flags.BoolVar(&options.noColor, "no-color", false, "disable colors and interactive rendering")
+}
+
+func currentVersion() string {
+	moduleVersion := ""
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		moduleVersion = buildInfo.Main.Version
+	}
+	return selectVersion(version, moduleVersion)
+}
+
+func selectVersion(injected, module string) string {
+	for _, candidate := range []string{injected, module} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && candidate != "dev" && candidate != "(devel)" {
+			return candidate
+		}
+	}
+	return "dev"
 }
