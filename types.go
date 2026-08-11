@@ -35,9 +35,10 @@ type containerInfo struct {
 }
 
 type imageInfo struct {
-	ID       string          `json:"Id"`
-	RepoTags []string        `json:"RepoTags"`
-	Config   containerConfig `json:"Config"`
+	ID          string          `json:"Id"`
+	RepoTags    []string        `json:"RepoTags"`
+	RepoDigests []string        `json:"RepoDigests"`
+	Config      containerConfig `json:"Config"`
 }
 
 type containerConfig struct {
@@ -53,6 +54,7 @@ type containerConfig struct {
 type updateCandidate struct {
 	Name           string
 	Image          string
+	Compose        bool
 	CurrentImageID string
 	LatestImageID  string
 	CurrentVersion string

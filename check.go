@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const maxConcurrentImageChecks = 4
+const maxConcurrentImageChecks = 8
 
 type containerSnapshot struct {
 	info  *containerInfo
@@ -16,7 +16,7 @@ type containerSnapshot struct {
 }
 
 func (a *application) check(ctx context.Context, options checkOptions) error {
-	a.ui.header("container update check")
+	a.ui.header("Container updates")
 
 	names, err := a.listRunningContainers(ctx)
 	if err != nil {
@@ -28,14 +28,15 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	}
 
 	var snapshots []containerSnapshot
-	var checkErrors []error
+	checkFailures := 0
 	var warnings []string
 	currentImages := make(map[string]*imageInfo)
 	if err := a.ui.spin(fmt.Sprintf("Inspecting %d running containers", len(names)), func() error {
 		for _, name := range names {
 			info, inspectErr := a.inspect(ctx, name)
 			if inspectErr != nil {
-				checkErrors = append(checkErrors, fmt.Errorf("inspect %s: %w", name, inspectErr))
+				checkFailures++
+				warnings = append(warnings, fmt.Sprintf("Could not inspect %s: %s", name, conciseError(inspectErr)))
 				continue
 			}
 			if info.HostConfig.AutoRemove {
@@ -46,7 +47,8 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 			if !ok {
 				image, inspectErr = a.inspectImage(ctx, info.Image)
 				if inspectErr != nil {
-					checkErrors = append(checkErrors, fmt.Errorf("inspect current image for %s: %w", name, inspectErr))
+					checkFailures++
+					warnings = append(warnings, fmt.Sprintf("Could not inspect the image for %s: %s", name, conciseError(inspectErr)))
 					continue
 				}
 				currentImages[info.Image] = image
@@ -62,8 +64,21 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	}
 
 	imageReferences := make(map[string]bool)
+	skippedReferences := make(map[string]bool)
 	for _, snapshot := range snapshots {
-		imageReferences[snapshot.info.Config.Image] = true
+		reference := snapshot.info.Config.Image
+		if remotelyUpdatableImage(reference, snapshot.image) {
+			imageReferences[reference] = true
+		} else {
+			skippedReferences[reference] = true
+		}
+	}
+	if len(skippedReferences) > 0 {
+		label := "images"
+		if len(skippedReferences) == 1 {
+			label = "image"
+		}
+		a.ui.info(fmt.Sprintf("Skipped %d local or pinned %s", len(skippedReferences), label))
 	}
 	references := sortedKeys(imageReferences)
 	latestImages := make(map[string]*imageInfo, len(references))
@@ -82,8 +97,8 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	}
 	for _, reference := range references {
 		if err := imageErrors[reference]; err != nil {
-			checkErrors = append(checkErrors, fmt.Errorf("check image %s: %w", reference, err))
-			a.ui.warning(fmt.Sprintf("Could not check %s", reference))
+			checkFailures++
+			a.ui.warning(fmt.Sprintf("Could not check %s: %s", reference, conciseError(err)))
 		}
 	}
 
@@ -98,8 +113,8 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	sort.Slice(updates, func(i, j int) bool { return updates[i].Name < updates[j].Name })
 
 	if len(updates) == 0 {
-		if len(checkErrors) > 0 {
-			return errors.Join(checkErrors...)
+		if checkFailures > 0 {
+			return newCheckSummaryError(checkFailures, 0)
 		}
 		a.ui.success(fmt.Sprintf("No updates available across %d running containers", len(names)))
 		return nil
@@ -112,7 +127,7 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	} else if !a.ui.isInteractive() {
 		a.ui.listUpdates(updates)
 		a.ui.info("Run drun check --yes to update every listed container")
-		return errors.Join(checkErrors...)
+		return newCheckSummaryError(checkFailures, 0)
 	} else {
 		selected, err = a.ui.selectUpdates(updates)
 		if err != nil {
@@ -121,27 +136,30 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	}
 	if len(selected) == 0 {
 		a.ui.warning("No containers selected")
-		return errors.Join(checkErrors...)
+		return newCheckSummaryError(checkFailures, 0)
 	}
 
 	updated := 0
 	alreadyCurrent := 0
-	var updateErrors []error
+	updateFailures := 0
 	for index, candidate := range selected {
-		a.ui.info(fmt.Sprintf("Updating %s (%d/%d)", candidate.Name, index+1, len(selected)))
+		a.ui.group(fmt.Sprintf("%s  %d/%d", candidate.Name, index+1, len(selected)))
 		changed, err := a.updateCheckedContainer(ctx, candidate)
 		if err != nil {
-			updateErrors = append(updateErrors, fmt.Errorf("update %s: %w", candidate.Name, err))
-			a.ui.warning(fmt.Sprintf("%s failed; check the container state", candidate.Name))
+			updateFailures++
+			a.ui.warning("Update failed: " + conciseError(err))
+			a.ui.endGroup()
 			continue
 		}
 		if !changed {
 			alreadyCurrent++
-			a.ui.info(candidate.Name + " was already updated")
+			a.ui.info("Already updated")
+			a.ui.endGroup()
 			continue
 		}
 		updated++
-		a.ui.success(fmt.Sprintf("%s updated %s -> %s", candidate.Name, candidate.CurrentVersion, candidate.LatestVersion))
+		a.ui.success(fmt.Sprintf("Updated %s → %s", candidate.CurrentVersion, candidate.LatestVersion))
+		a.ui.endGroup()
 	}
 
 	switch {
@@ -154,7 +172,82 @@ func (a *application) check(ctx context.Context, options checkOptions) error {
 	default:
 		a.ui.warning(fmt.Sprintf("Updated %d of %d selected containers", updated, len(selected)))
 	}
-	return errors.Join(append(checkErrors, updateErrors...)...)
+	return newCheckSummaryError(checkFailures, updateFailures)
+}
+
+type checkSummaryError struct {
+	checkFailures  int
+	updateFailures int
+}
+
+func newCheckSummaryError(checkFailures, updateFailures int) error {
+	if checkFailures == 0 && updateFailures == 0 {
+		return nil
+	}
+	return checkSummaryError{checkFailures: checkFailures, updateFailures: updateFailures}
+}
+
+func (err checkSummaryError) Error() string {
+	parts := make([]string, 0, 2)
+	if err.checkFailures > 0 {
+		if err.checkFailures == 1 {
+			parts = append(parts, "1 update check failed")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d update checks failed", err.checkFailures))
+		}
+	}
+	if err.updateFailures > 0 {
+		if err.updateFailures == 1 {
+			parts = append(parts, "1 container update failed")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d container updates failed", err.updateFailures))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func conciseError(err error) string {
+	message := strings.TrimSpace(err.Error())
+	if lines := strings.Split(message, "\n"); len(lines) > 0 {
+		message = strings.TrimSpace(lines[len(lines)-1])
+	}
+	message = strings.TrimPrefix(message, "Error response from daemon: ")
+	if strings.Contains(message, "exit status") {
+		if separator := strings.LastIndex(message, ": "); separator >= 0 {
+			message = message[separator+2:]
+		}
+	}
+	runes := []rune(message)
+	if len(runes) > 180 {
+		message = string(runes[:179]) + "…"
+	}
+	return message
+}
+
+func remotelyUpdatableImage(reference string, image *imageInfo) bool {
+	reference = strings.TrimSpace(reference)
+	if reference == "" || strings.HasPrefix(reference, "sha256:") || strings.Contains(reference, "@") || image == nil {
+		return false
+	}
+	repository := normalizedRepository(reference)
+	for _, digest := range image.RepoDigests {
+		digestRepository, _, found := strings.Cut(digest, "@")
+		if found && normalizedRepository(digestRepository) == repository {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedRepository(reference string) string {
+	reference, _, _ = strings.Cut(reference, "@")
+	lastSlash := strings.LastIndex(reference, "/")
+	if colon := strings.LastIndex(reference, ":"); colon > lastSlash {
+		reference = reference[:colon]
+	}
+	reference = strings.TrimPrefix(reference, "index.docker.io/")
+	reference = strings.TrimPrefix(reference, "docker.io/")
+	return strings.TrimPrefix(reference, "library/")
 }
 
 type imageCheckResult struct {
@@ -235,7 +328,8 @@ func (a *application) updateCheckedContainer(ctx context.Context, candidate upda
 		return false, err
 	}
 	if isCompose {
-		return true, a.replaceCompose(ctx, info, compose.upArgs(), candidate.LatestImageID)
+		args := compose.upArgs()
+		return true, a.replaceCompose(ctx, info, args, candidate.LatestImageID)
 	}
 	runArgs := buildRunArgs(info, &currentImage.Config)
 	backupName := backupContainerName(candidate.Name, a.now())
@@ -247,11 +341,17 @@ func newUpdateCandidate(info *containerInfo, current, latest *imageInfo) updateC
 	return updateCandidate{
 		Name:           strings.TrimPrefix(info.Name, "/"),
 		Image:          info.Config.Image,
+		Compose:        isComposeContainer(info),
 		CurrentImageID: info.Image,
 		LatestImageID:  latest.ID,
 		CurrentVersion: currentVersion,
 		LatestVersion:  latestVersion,
 	}
+}
+
+func isComposeContainer(info *containerInfo) bool {
+	labels := info.Config.Labels
+	return strings.TrimSpace(labels[composeProjectLabel]) != "" && strings.TrimSpace(labels[composeServiceLabel]) != ""
 }
 
 func displayImageVersions(current, latest *imageInfo) (string, string) {

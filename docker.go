@@ -41,6 +41,8 @@ func (dockerCLI) run(ctx context.Context, args ...string) ([]byte, error) {
 
 type terminal interface {
 	header(string)
+	group(string)
+	endGroup()
 	info(string)
 	warning(string)
 	success(string)
@@ -75,7 +77,7 @@ func newApplication(docker commandRunner, ui terminal) *application {
 }
 
 func (a *application) refresh(ctx context.Context, options refreshOptions) error {
-	a.ui.header("safe container refresh")
+	a.ui.header("Safe container refresh")
 
 	var info *containerInfo
 	var currentImage *imageInfo

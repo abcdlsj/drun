@@ -94,9 +94,9 @@ drun check
 
 Set the standard `NO_COLOR` environment variable to disable color as well.
 
-Running `drun` without a container scans every running container for updates. `drun check` is an equivalent compatibility command. In an interactive terminal every update is selected by default: use the arrow keys to move, Space to toggle an item, `a` to select or clear all, and Enter to update the selection.
+Running `drun` without a container scans every running container for updates. `drun check` is an equivalent compatibility command. No updates are selected by default: use the arrow keys to move, Space to toggle an item, `a` to select or clear all, and Enter to update the selection.
 
-Checking for updates pulls each unique image once, but it does not stop or replace any container until the selection is confirmed. In non-interactive output, `drun` only lists updates unless `--yes` is supplied.
+Checking for updates pulls each unique remote image once, but it does not stop or replace any container until the selection is confirmed. Locally built images and images pinned by digest are skipped. Running Docker Compose containers are detected from their standard labels and marked as `compose` in the update list. Single-container refreshes print the exact `docker compose up` command before confirmation; batch updates keep the output compact. Stopped or not-yet-created Compose services are not discovered. In non-interactive output, `drun` only lists updates unless `--yes` is supplied.
 
 ## Safe replacement
 

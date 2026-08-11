@@ -29,6 +29,7 @@ type terminalUI struct {
 	err         io.Writer
 	interactive bool
 	width       int
+	indent      int
 }
 
 func newTerminalUI(in io.Reader, out, errOut io.Writer, noColor bool) *terminalUI {
@@ -50,16 +51,30 @@ func newTerminalUI(in io.Reader, out, errOut io.Writer, noColor bool) *terminalU
 
 func (ui *terminalUI) header(subtitleText string) {
 	if !ui.interactive {
-		fmt.Fprintf(ui.out, "drun - %s\n", subtitleText)
+		fmt.Fprintf(ui.out, "Drun - %s\n", subtitleText)
 		return
 	}
-	brand := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("drun")
+	brand := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("Drun")
 	subtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(subtitleText)
 	fmt.Fprintf(ui.out, "\n  %s  %s\n\n", brand, subtitle)
 }
 
 func (ui *terminalUI) isInteractive() bool {
 	return ui.interactive
+}
+
+func (ui *terminalUI) group(message string) {
+	if !ui.interactive {
+		fmt.Fprintln(ui.out, message)
+		return
+	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(message)
+	fmt.Fprintf(ui.out, "\n  %s\n", title)
+	ui.indent = 1
+}
+
+func (ui *terminalUI) endGroup() {
+	ui.indent = 0
 }
 
 func (ui *terminalUI) info(message string) {
@@ -84,7 +99,8 @@ func (ui *terminalUI) printStatus(mark, plainMark string, color lipgloss.Color, 
 		return
 	}
 	marker := lipgloss.NewStyle().Bold(true).Foreground(color).Render(mark)
-	fmt.Fprintf(writer, "  %s  %s\n", marker, message)
+	prefix := strings.Repeat("  ", ui.indent+1)
+	fmt.Fprintf(writer, "%s%s  %s\n", prefix, marker, message)
 }
 
 func (ui *terminalUI) summary(info *containerInfo) {
@@ -111,9 +127,8 @@ func (ui *terminalUI) updateAvailable(update updateCandidate) {
 	}
 	label := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("update")
 	name := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(update.Name)
-	change := lipgloss.NewStyle().Foreground(colorText).Render(update.CurrentVersion + " → " + update.LatestVersion)
 	image := lipgloss.NewStyle().Foreground(colorMuted).Render(update.Image)
-	fmt.Fprintf(ui.out, "  %s  %s  %s\n          %s\n\n", label, name, change, image)
+	fmt.Fprintf(ui.out, "  %s  %s  %s\n          %s\n\n", label, name, renderUpdateMeta(update), image)
 }
 
 func (ui *terminalUI) listUpdates(updates []updateCandidate) {
@@ -122,17 +137,20 @@ func (ui *terminalUI) listUpdates(updates []updateCandidate) {
 		fmt.Fprintf(ui.out, "  %s\n", title)
 		for _, update := range updates {
 			name := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(update.Name)
-			change := lipgloss.NewStyle().Foreground(colorText).Render(update.CurrentVersion + " → " + update.LatestVersion)
 			image := lipgloss.NewStyle().Foreground(colorMuted).Render(update.Image)
 			marker := lipgloss.NewStyle().Foreground(colorCyan).Render("•")
-			fmt.Fprintf(ui.out, "  %s %s  %s\n    %s\n", marker, name, change, image)
+			fmt.Fprintf(ui.out, "  %s %s  %s\n    %s\n", marker, name, renderUpdateMeta(update), image)
 		}
 		fmt.Fprintln(ui.out)
 		return
 	}
 	fmt.Fprintf(ui.out, "%d updates available\n", len(updates))
 	for _, update := range updates {
-		fmt.Fprintf(ui.out, "- %s: %s -> %s (%s)\n", update.Name, update.CurrentVersion, update.LatestVersion, update.Image)
+		kind := ""
+		if update.Compose {
+			kind = " [compose]"
+		}
+		fmt.Fprintf(ui.out, "- %s%s: %s -> %s (%s)\n", update.Name, kind, update.CurrentVersion, update.LatestVersion, update.Image)
 	}
 }
 
@@ -173,7 +191,8 @@ func (ui *terminalUI) command(args []string) {
 	}
 
 	label := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("command")
-	commandWidth := min(88, max(32, ui.width-8))
+	margin := 2 * (ui.indent + 1)
+	commandWidth := min(88, max(32, ui.width-margin-4))
 	body := lipgloss.NewStyle().
 		Foreground(colorText).
 		BorderStyle(lipgloss.NormalBorder()).
@@ -182,7 +201,9 @@ func (ui *terminalUI) command(args []string) {
 		PaddingLeft(2).
 		Width(commandWidth).
 		Render(command)
-	fmt.Fprintf(ui.out, "  %s\n%s\n\n", label, body)
+	body = lipgloss.NewStyle().MarginLeft(margin).Render(body)
+	prefix := strings.Repeat(" ", margin)
+	fmt.Fprintf(ui.out, "%s%s\n%s\n\n", prefix, label, body)
 }
 
 func (ui *terminalUI) confirm(message string) (bool, error) {
@@ -225,7 +246,7 @@ func (ui *terminalUI) spin(message string, action func() error) error {
 	}
 
 	program := tea.NewProgram(
-		newTaskModel(message, action),
+		newTaskModel(message, action, ui.indent),
 		tea.WithInput(nil),
 		tea.WithOutput(ui.out),
 	)
@@ -248,15 +269,16 @@ type taskModel struct {
 	spinner spinner.Model
 	message string
 	action  func() error
+	indent  int
 	done    bool
 	err     error
 }
 
-func newTaskModel(message string, action func() error) taskModel {
+func newTaskModel(message string, action func() error, indent int) taskModel {
 	component := spinner.New()
 	component.Spinner = spinner.Dot
 	component.Style = lipgloss.NewStyle().Foreground(colorCyan)
-	return taskModel{spinner: component, message: message, action: action}
+	return taskModel{spinner: component, message: message, action: action, indent: indent}
 }
 
 func (m taskModel) Init() tea.Cmd {
@@ -280,15 +302,16 @@ func (m taskModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m taskModel) View() string {
 	text := lipgloss.NewStyle().Foreground(colorText).Render(m.message)
+	prefix := strings.Repeat("  ", m.indent+1)
 	if !m.done {
-		return fmt.Sprintf("  %s %s", m.spinner.View(), text)
+		return fmt.Sprintf("%s%s %s", prefix, m.spinner.View(), text)
 	}
 	if m.err != nil {
 		mark := lipgloss.NewStyle().Bold(true).Foreground(colorRed).Render("×")
-		return fmt.Sprintf("  %s  %s\n", mark, text)
+		return fmt.Sprintf("%s%s  %s\n", prefix, mark, text)
 	}
 	mark := lipgloss.NewStyle().Bold(true).Foreground(colorGreen).Render("✓")
-	return fmt.Sprintf("  %s  %s\n", mark, text)
+	return fmt.Sprintf("%s%s  %s\n", prefix, mark, text)
 }
 
 type confirmModel struct {
@@ -307,9 +330,6 @@ type updateSelectorModel struct {
 
 func newUpdateSelectorModel(updates []updateCandidate) updateSelectorModel {
 	selected := make([]bool, len(updates))
-	for index := range updates {
-		selected[index] = true
-	}
 	return updateSelectorModel{updates: updates, selected: selected, maxRows: 7}
 }
 
@@ -390,9 +410,8 @@ func (m updateSelectorModel) View() string {
 			marker = lipgloss.NewStyle().Foreground(colorCyan).Render("●")
 			nameStyle = lipgloss.NewStyle().Bold(true).Foreground(colorText)
 		}
-		change := lipgloss.NewStyle().Foreground(colorText).Render(update.CurrentVersion + " → " + update.LatestVersion)
 		image := lipgloss.NewStyle().Foreground(colorMuted).Render(update.Image)
-		fmt.Fprintf(&body, "  %s %s %s  %s\n      %s\n", cursor, marker, nameStyle.Render(update.Name), change, image)
+		fmt.Fprintf(&body, "  %s %s %s  %s\n      %s\n", cursor, marker, nameStyle.Render(update.Name), renderUpdateMeta(update), image)
 	}
 	if end < len(m.updates) {
 		fmt.Fprintf(&body, "  %s\n", lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("… %d more", len(m.updates)-end)))
@@ -400,6 +419,15 @@ func (m updateSelectorModel) View() string {
 	hint := lipgloss.NewStyle().Foreground(colorMuted).Render("↑↓ move · space toggle · a all · enter update · q cancel")
 	body.WriteString("\n  " + hint + "\n")
 	return body.String()
+}
+
+func renderUpdateMeta(update updateCandidate) string {
+	change := lipgloss.NewStyle().Foreground(colorText).Render(update.CurrentVersion + " → " + update.LatestVersion)
+	if !update.Compose {
+		return change
+	}
+	badge := lipgloss.NewStyle().Bold(true).Foreground(colorCyan).Render("compose")
+	return badge + "  " + change
 }
 
 func newConfirmModel(message string) confirmModel {

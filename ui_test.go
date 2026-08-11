@@ -87,12 +87,13 @@ func TestUpdateRendering(t *testing.T) {
 	ui.updateAvailable(updateCandidate{
 		Name:           "web",
 		Image:          "ghcr.io/acme/web:main",
+		Compose:        true,
 		CurrentVersion: "v1.4.2",
 		LatestVersion:  "v1.5.0",
 	})
 
 	view := output.String()
-	for _, text := range []string{"update", "web", "v1.4.2 → v1.5.0", "ghcr.io/acme/web:main"} {
+	for _, text := range []string{"update", "web", "compose", "v1.4.2 → v1.5.0", "ghcr.io/acme/web:main"} {
 		if !strings.Contains(view, text) {
 			t.Fatalf("updateAvailable() output does not contain %q: %q", text, view)
 		}
@@ -114,6 +115,20 @@ func TestPlainStatus(t *testing.T) {
 	}
 	if got, want := errorOutput.String(), "[x] failed\n"; got != want {
 		t.Fatalf("plain error output = %q, want %q", got, want)
+	}
+}
+
+func TestGroupedStatus(t *testing.T) {
+	var output bytes.Buffer
+	ui := &terminalUI{out: &output, interactive: true}
+
+	ui.group("web  1/2")
+	ui.success("Updated")
+	ui.endGroup()
+
+	view := output.String()
+	if !strings.Contains(view, "web  1/2") || !strings.Contains(view, "\n    ") {
+		t.Fatalf("grouped status has no visible hierarchy: %q", view)
 	}
 }
 

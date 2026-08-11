@@ -30,8 +30,8 @@ render_frame() {
   <circle cx="72" cy="22" r="7" fill="#28c840"/>
   <text x="550" y="28" text-anchor="middle" fill="#8b95a7" font-family="$font" font-size="14">drun demo</text>
 
-  <text x="44" y="100" fill="#39d0d8" font-family="$font" font-size="20" font-weight="700">drun</text>
-  <text x="102" y="100" fill="#7f8a9a" font-family="$font" font-size="16">safe container refresh</text>
+  <text x="44" y="100" fill="#39d0d8" font-family="$font" font-size="20" font-weight="700">Drun</text>
+  <text x="102" y="100" fill="#7f8a9a" font-family="$font" font-size="16">Safe container refresh</text>
 
   <text x="44" y="151" fill="#5ee38e" font-family="Arial" font-size="17">✓</text>
   <text x="70" y="151" fill="#e7edf5" font-family="$font" font-size="17">Inspecting container configuration</text>

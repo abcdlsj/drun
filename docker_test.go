@@ -141,7 +141,7 @@ func TestComposeDryRun(t *testing.T) {
 func TestComposeRefresh(t *testing.T) {
 	info := sampleComposeContainerInfo()
 	docker := &fakeDocker{inspectInfo: info}
-	ui := &fakeTerminal{confirmed: true}
+	ui := &recordingTerminal{fakeTerminal: fakeTerminal{confirmed: true}}
 	app := newApplication(docker, ui)
 
 	if err := app.refresh(context.Background(), refreshOptions{containerName: "demo-web-1", yes: true}); err != nil {
@@ -149,6 +149,19 @@ func TestComposeRefresh(t *testing.T) {
 	}
 	if got := countDockerCalls(docker.calls, "compose"); got != 1 {
 		t.Fatalf("compose calls = %d, want 1; calls: %#v", got, docker.calls)
+	}
+	if len(ui.commands) != 1 || len(ui.commands[0]) < 2 || ui.commands[0][0] != "docker" || ui.commands[0][1] != "compose" {
+		t.Fatalf("displayed command is not a Compose command: %#v", ui.commands)
+	}
+	var executed []string
+	for _, call := range docker.calls {
+		if len(call) > 0 && call[0] == "compose" {
+			executed = call
+			break
+		}
+	}
+	if !reflect.DeepEqual(ui.commands[0][1:], executed) {
+		t.Fatalf("displayed command = %#v, executed = %#v", ui.commands[0][1:], executed)
 	}
 	for _, call := range docker.calls {
 		if len(call) > 0 && (call[0] == "run" || call[0] == "stop" || call[0] == "rename") {
@@ -415,6 +428,8 @@ type fakeTerminal struct {
 }
 
 func (*fakeTerminal) header(string)                   {}
+func (*fakeTerminal) group(string)                    {}
+func (*fakeTerminal) endGroup()                       {}
 func (*fakeTerminal) info(string)                     {}
 func (*fakeTerminal) warning(string)                  {}
 func (*fakeTerminal) success(string)                  {}

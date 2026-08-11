@@ -44,6 +44,23 @@ func TestCheckNonInteractive(t *testing.T) {
 	}
 }
 
+func TestCheckLocalImage(t *testing.T) {
+	docker := newCheckDocker()
+	for id, image := range docker.images {
+		image.RepoDigests = nil
+		docker.images[id] = image
+	}
+	docker.latest.RepoDigests = nil
+	app := newApplication(docker, &fakeTerminal{})
+
+	if err := app.check(context.Background(), checkOptions{}); err != nil {
+		t.Fatalf("check() error = %v", err)
+	}
+	if got := countDockerCalls(docker.calls, "pull"); got != 0 {
+		t.Fatalf("local images triggered %d pulls", got)
+	}
+}
+
 func TestCheckYes(t *testing.T) {
 	docker := newCheckDocker()
 	ui := &fakeTerminal{nonInteractive: true}
@@ -86,7 +103,10 @@ func TestImageCheckConcurrency(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	app := newApplication(docker, &fakeTerminal{})
-	references := []string{"example/a:latest", "example/b:latest", "example/c:latest", "example/d:latest", "example/e:latest"}
+	references := make([]string, maxConcurrentImageChecks+1)
+	for index := range references {
+		references[index] = fmt.Sprintf("example/image-%d:latest", index)
+	}
 
 	type result struct {
 		images map[string]*imageInfo
@@ -195,16 +215,46 @@ func TestImageVersions(t *testing.T) {
 	}
 }
 
+func TestRemoteImage(t *testing.T) {
+	tests := []struct {
+		name      string
+		reference string
+		digests   []string
+		want      bool
+	}{
+		{name: "matching digest", reference: "nginx:latest", digests: []string{"nginx@sha256:abc"}, want: true},
+		{name: "canonical Docker Hub", reference: "docker.io/library/nginx:latest", digests: []string{"nginx@sha256:abc"}, want: true},
+		{name: "local build", reference: "example/local:latest"},
+		{name: "retagged image", reference: "example/local:latest", digests: []string{"example/upstream@sha256:abc"}},
+		{name: "pinned digest", reference: "nginx@sha256:abc", digests: []string{"nginx@sha256:abc"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			image := &imageInfo{RepoDigests: test.digests}
+			if got := remotelyUpdatableImage(test.reference, image); got != test.want {
+				t.Fatalf("remotelyUpdatableImage() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestConciseError(t *testing.T) {
+	err := fmt.Errorf("docker pull example/app: exit status 1: Using default tag: latest\nError response from daemon: pull access denied")
+	if got, want := conciseError(err), "pull access denied"; got != want {
+		t.Fatalf("conciseError() = %q, want %q", got, want)
+	}
+}
+
 func TestUpdateSelection(t *testing.T) {
 	updates := []updateCandidate{{Name: "api"}, {Name: "web"}}
 	model := newUpdateSelectorModel(updates)
-	if !model.selected[0] || !model.selected[1] {
-		t.Fatalf("default selection = %#v, want every update selected", model.selected)
+	if model.selected[0] || model.selected[1] {
+		t.Fatalf("default selection = %#v, want no updates selected", model.selected)
 	}
 
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	model = updated.(updateSelectorModel)
-	if model.selected[0] || !model.selected[1] {
+	if !model.selected[0] || model.selected[1] {
 		t.Fatalf("selection after space = %#v", model.selected)
 	}
 
@@ -246,8 +296,8 @@ func (d *parallelCheckDocker) run(ctx context.Context, args ...string) ([]byte, 
 }
 
 func newCheckDocker() *checkDocker {
-	old := imageInfo{ID: "sha256:old", RepoTags: []string{"example/app:v1.0.0"}}
-	latest := imageInfo{ID: "sha256:new", RepoTags: []string{"example/app:v1.1.0"}}
+	old := imageInfo{ID: "sha256:old", RepoTags: []string{"example/app:v1.0.0"}, RepoDigests: []string{"example/app@sha256:old"}}
+	latest := imageInfo{ID: "sha256:new", RepoTags: []string{"example/app:v1.1.0"}, RepoDigests: []string{"example/app@sha256:new"}}
 	containers := map[string]*containerInfo{}
 	for _, name := range []string{"api", "web"} {
 		info := sampleContainerInfo()
