@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""A stand-in docker CLI that serves fixed containers for the README demo."""
+import json
+import os
+import sys
+import time
+
+STATE = os.environ["DRUN_DEMO_STATE"]
+
+IMMICH = {
+    "com.docker.compose.project": "immich",
+    "com.docker.compose.service": "server",
+    "com.docker.compose.project.working_dir": "/srv/immich",
+    "com.docker.compose.project.config_files": "/srv/immich/compose.yml",
+}
+
+# name: (image reference, current image, latest image, labels)
+CONTAINERS = {
+    "caddy": ("caddy:2", "caddy-2.8.4", "caddy-2.9.1", {}),
+    "grafana": ("grafana/grafana-oss:latest", "grafana-11.2.0", "grafana-11.3.1", {}),
+    "immich-server-1": ("ghcr.io/immich-app/immich-server:release", "immich-v1.119.0", "immich-v1.120.2", IMMICH),
+    "postgres": ("postgres:16", "postgres-16.4", "postgres-16.4", {}),
+    "redis": ("redis:7-alpine", "redis-7.4.1", "redis-7.4.1", {}),
+    "dev-tools": ("local/dev-tools:latest", "dev-tools", None, {}),
+}
+PULL_SECONDS = {"caddy:2": 1.2, "grafana/grafana-oss:latest": 2.0,
+                "ghcr.io/immich-app/immich-server:release": 2.6, "postgres:16": 0.8, "redis:7-alpine": 1.0}
+
+
+def image_id(name):
+    return "sha256:" + name.encode().hex().ljust(64, "0")[:64]
+
+
+def tag(name):
+    return name.rsplit("-", 1)[1]
+
+
+def updated(name):
+    return os.path.exists(os.path.join(STATE, name))
+
+
+def container(name):
+    reference, current, latest, labels = CONTAINERS[name]
+    return {
+        "Id": image_id(name)[7:],
+        "Name": "/" + name,
+        "Image": image_id(latest if updated(name) else current),
+        "Config": {"Image": reference, "Labels": labels, "Cmd": ["serve"]},
+        "State": {"Running": True, "Status": "running"},
+        "HostConfig": {"NetworkMode": "bridge", "RestartPolicy": {"Name": "unless-stopped"}},
+        "NetworkSettings": {"Networks": {"bridge": {}}},
+    }
+
+
+def image(reference):
+    for repository, current, latest, _ in CONTAINERS.values():
+        for version in (current, latest):
+            if version and reference in (repository, image_id(version)):
+                if reference == repository:
+                    version = latest or current
+                base = repository.rsplit(":", 1)[0]
+                digests = [] if repository.startswith("local/") else [base + "@sha256:" + "0" * 64]
+                return {"Id": image_id(version), "RepoTags": [base + ":" + tag(version)],
+                        "RepoDigests": digests, "Config": {"Cmd": ["serve"]}}
+    sys.exit("Error: No such image: " + reference)
+
+
+args = sys.argv[1:]
+command = args[0] if args else ""
+if command == "ps":
+    print("\n".join(sorted(CONTAINERS)))
+elif command == "inspect":
+    print(json.dumps([container(name) for name in args[3:]]))
+elif command == "image":
+    print(json.dumps([image(reference) for reference in args[2:]]))
+elif command == "pull":
+    time.sleep(PULL_SECONDS.get(args[-1], 1))
+else:
+    time.sleep(0.7)
+    if command == "run":
+        open(os.path.join(STATE, args[args.index("--name") + 1]), "w").close()
+    elif command == "compose":
+        open(os.path.join(STATE, "immich-server-1"), "w").close()

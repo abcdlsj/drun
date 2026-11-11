@@ -145,7 +145,7 @@ go vet ./...
 go build ./...
 ```
 
-Regenerate the README animation with ImageMagick:
+Regenerate the README animation with [VHS](https://github.com/charmbracelet/vhs). The script records the real binary against a stand-in `docker` from `scripts/demo`, so no Docker daemon is needed:
 
 ```bash
 ./scripts/generate-demo.sh
