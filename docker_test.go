@@ -106,7 +106,7 @@ func TestDryRun(t *testing.T) {
 	if err := app.refresh(context.Background(), refreshOptions{containerName: "web", dryRun: true}); err != nil {
 		t.Fatalf("refresh() error = %v", err)
 	}
-	want := [][]string{{"inspect", "web"}, {"image", "inspect", "sha256:old"}}
+	want := [][]string{{"inspect", "--type", "container", "web"}, {"image", "inspect", "sha256:old"}}
 	if !reflect.DeepEqual(docker.calls, want) {
 		t.Fatalf("docker calls = %#v, want %#v", docker.calls, want)
 	}
@@ -121,7 +121,7 @@ func TestComposeDryRun(t *testing.T) {
 	if err := app.refresh(context.Background(), refreshOptions{containerName: "demo-web-1", dryRun: true}); err != nil {
 		t.Fatalf("refresh() error = %v", err)
 	}
-	wantCalls := [][]string{{"inspect", "demo-web-1"}, {"image", "inspect", "sha256:old"}}
+	wantCalls := [][]string{{"inspect", "--type", "container", "demo-web-1"}, {"image", "inspect", "sha256:old"}}
 	if !reflect.DeepEqual(docker.calls, wantCalls) {
 		t.Fatalf("docker calls = %#v, want %#v", docker.calls, wantCalls)
 	}
@@ -192,9 +192,9 @@ func TestRefreshCancel(t *testing.T) {
 		t.Fatalf("refresh() error = %v, want errCancelled", err)
 	}
 	want := [][]string{
-		{"inspect", "web"},
+		{"inspect", "--type", "container", "web"},
 		{"image", "inspect", "sha256:old"},
-		{"pull", "nginx:latest"},
+		{"pull", "--quiet", "nginx:latest"},
 		{"image", "inspect", "nginx:latest"},
 	}
 	if !reflect.DeepEqual(docker.calls, want) {
@@ -215,9 +215,9 @@ func TestRefreshSuccess(t *testing.T) {
 	}
 
 	wantPrefix := [][]string{
-		{"inspect", "web"},
+		{"inspect", "--type", "container", "web"},
 		{"image", "inspect", "sha256:old"},
-		{"pull", "nginx:latest"},
+		{"pull", "--quiet", "nginx:latest"},
 		{"image", "inspect", "nginx:latest"},
 		{"stop", "web"},
 		{"rename", "web", "web-drun-backup-1234"},
@@ -427,29 +427,31 @@ type fakeTerminal struct {
 	selectCalls    int
 }
 
-func (*fakeTerminal) header(string)                   {}
-func (*fakeTerminal) group(string)                    {}
-func (*fakeTerminal) endGroup()                       {}
-func (*fakeTerminal) info(string)                     {}
-func (*fakeTerminal) warning(string)                  {}
-func (*fakeTerminal) success(string)                  {}
-func (*fakeTerminal) command([]string)                {}
-func (*fakeTerminal) summary(*containerInfo)          {}
-func (*fakeTerminal) updateAvailable(updateCandidate) {}
-func (*fakeTerminal) listUpdates([]updateCandidate)   {}
-func (ui *fakeTerminal) selectUpdates(updates []updateCandidate) ([]updateCandidate, error) {
-	ui.selectCalls++
-	return updates, nil
-}
-func (ui *fakeTerminal) isInteractive() bool                   { return !ui.nonInteractive }
+func (ui *fakeTerminal) interactive() bool                     { return !ui.nonInteractive }
+func (*fakeTerminal) notice(noticeKind, string)                {}
+func (*fakeTerminal) step(_ string, action func() error) error { return action() }
+func (*fakeTerminal) target(*containerInfo)                    {}
+func (*fakeTerminal) plan(*updateCandidate, []string)          {}
 func (ui *fakeTerminal) confirm(string) (bool, error)          { return ui.confirmed, nil }
-func (*fakeTerminal) spin(_ string, action func() error) error { return action() }
+func (*fakeTerminal) rows([]containerRow)                      {}
+func (*fakeTerminal) row(containerRow)                         {}
+func (*fakeTerminal) scanned([]containerRow)                   {}
+func (ui *fakeTerminal) selectUpdates(rows []containerRow) ([]string, error) {
+	ui.selectCalls++
+	var keys []string
+	for _, row := range rows {
+		if row.state == rowUpdatable {
+			keys = append(keys, row.key)
+		}
+	}
+	return keys, nil
+}
 
 type recordingTerminal struct {
 	fakeTerminal
 	commands [][]string
 }
 
-func (ui *recordingTerminal) command(args []string) {
-	ui.commands = append(ui.commands, append([]string(nil), args...))
+func (ui *recordingTerminal) plan(_ *updateCandidate, command []string) {
+	ui.commands = append(ui.commands, append([]string(nil), command...))
 }

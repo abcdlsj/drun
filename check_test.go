@@ -3,12 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
-
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestCheckSharedImage(t *testing.T) {
@@ -85,7 +84,7 @@ func TestCheckedContainerCurrent(t *testing.T) {
 
 	changed, err := app.updateCheckedContainer(context.Background(), updateCandidate{
 		Name: "web", CurrentImageID: "sha256:old", LatestImageID: "sha256:new",
-	})
+	}, func(_ string, action func() error) error { return action() })
 	if err != nil {
 		t.Fatalf("updateCheckedContainer() error = %v", err)
 	}
@@ -109,13 +108,20 @@ func TestImageCheckConcurrency(t *testing.T) {
 	}
 
 	type result struct {
-		images map[string]*imageInfo
-		errors map[string]error
+		images int
+		errors int
 	}
 	done := make(chan result, 1)
 	go func() {
-		images, imageErrors := app.checkLatestImages(context.Background(), references)
-		done <- result{images: images, errors: imageErrors}
+		var got result
+		app.checkLatestImages(context.Background(), references, func(check imageCheckResult) {
+			if check.err != nil {
+				got.errors++
+			} else {
+				got.images++
+			}
+		})
+		done <- got
 	}()
 
 	var releaseOnce sync.Once
@@ -137,8 +143,8 @@ func TestImageCheckConcurrency(t *testing.T) {
 
 	select {
 	case got := <-done:
-		if len(got.images) != len(references) || len(got.errors) != 0 {
-			t.Fatalf("checkLatestImages() returned %d images and %d errors", len(got.images), len(got.errors))
+		if got.images != len(references) || got.errors != 0 {
+			t.Fatalf("checkLatestImages() returned %d images and %d errors", got.images, got.errors)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("concurrent image check did not finish")
@@ -245,26 +251,6 @@ func TestConciseError(t *testing.T) {
 	}
 }
 
-func TestUpdateSelection(t *testing.T) {
-	updates := []updateCandidate{{Name: "api"}, {Name: "web"}}
-	model := newUpdateSelectorModel(updates)
-	if model.selected[0] || model.selected[1] {
-		t.Fatalf("default selection = %#v, want no updates selected", model.selected)
-	}
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
-	model = updated.(updateSelectorModel)
-	if !model.selected[0] || model.selected[1] {
-		t.Fatalf("selection after space = %#v", model.selected)
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
-	model = updated.(updateSelectorModel)
-	if !model.selected[0] || !model.selected[1] {
-		t.Fatalf("selection after a = %#v, want all selected", model.selected)
-	}
-}
-
 type checkDocker struct {
 	mu         sync.Mutex
 	calls      [][]string
@@ -281,7 +267,7 @@ type parallelCheckDocker struct {
 
 func (d *parallelCheckDocker) run(ctx context.Context, args ...string) ([]byte, error) {
 	if len(args) > 0 && args[0] == "pull" {
-		d.started <- args[1]
+		d.started <- args[len(args)-1]
 		select {
 		case <-d.release:
 			return nil, nil
@@ -330,25 +316,33 @@ func (d *checkDocker) run(_ context.Context, args ...string) ([]byte, error) {
 	case "ps":
 		return []byte("api\ncurrent\nweb\n"), nil
 	case "inspect":
-		info, ok := d.containers[args[1]]
-		if !ok {
-			return nil, fmt.Errorf("unknown container %s", args[1])
+		var infos []containerInfo
+		for _, name := range args[3:] {
+			info, ok := d.containers[name]
+			if !ok {
+				return nil, fmt.Errorf("unknown container %s", name)
+			}
+			copy := *info
+			if d.updated[name] {
+				copy.Image = d.latest.ID
+			}
+			infos = append(infos, copy)
 		}
-		copy := *info
-		if d.updated[args[1]] {
-			copy.Image = d.latest.ID
-		}
-		return json.Marshal([]containerInfo{copy})
+		return json.Marshal(infos)
 	case "image":
-		reference := args[2]
-		if reference == "example/app:latest" {
-			return json.Marshal([]imageInfo{d.latest})
+		var images []imageInfo
+		for _, reference := range args[2:] {
+			if reference == "example/app:latest" {
+				images = append(images, d.latest)
+				continue
+			}
+			image, ok := d.images[reference]
+			if !ok {
+				return nil, fmt.Errorf("unknown image %s", reference)
+			}
+			images = append(images, image)
 		}
-		image, ok := d.images[reference]
-		if !ok {
-			return nil, fmt.Errorf("unknown image %s", reference)
-		}
-		return json.Marshal([]imageInfo{image})
+		return json.Marshal(images)
 	case "run":
 		for index, argument := range args {
 			if argument == "--name" && index+1 < len(args) {
@@ -374,4 +368,107 @@ func countDockerCalls(calls [][]string, command string) int {
 		}
 	}
 	return count
+}
+
+func TestCheckBatchesInspect(t *testing.T) {
+	docker := newCheckDocker()
+	app := newApplication(docker, &fakeTerminal{nonInteractive: true})
+
+	if err := app.check(context.Background(), checkOptions{}); err != nil {
+		t.Fatalf("check() error = %v", err)
+	}
+	if got := countDockerCalls(docker.calls, "inspect"); got != 1 {
+		t.Fatalf("container inspect calls = %d, want 1; calls: %#v", got, docker.calls)
+	}
+	if got := countDockerCalls(docker.calls, "image"); got != 2 {
+		t.Fatalf("image inspect calls = %d, want 1 batch and 1 after pull; calls: %#v", got, docker.calls)
+	}
+}
+
+func TestCheckComposeReplicas(t *testing.T) {
+	docker := newCheckDocker()
+	labels := sampleComposeContainerInfo().Config.Labels
+	docker.containers["api"].Config.Labels = labels
+	docker.containers["web"].Config.Labels = labels
+	ui := &rowTerminal{}
+	app := newApplication(docker, ui)
+
+	if err := app.check(context.Background(), checkOptions{yes: true}); err != nil {
+		t.Fatalf("check() error = %v", err)
+	}
+	if got := countDockerCalls(docker.calls, "compose"); got != 1 {
+		t.Fatalf("compose calls = %d, want 1 for both replicas; calls: %#v", got, docker.calls)
+	}
+	if got := len(ui.scannedRows); got != 2 {
+		t.Fatalf("scan rows = %d, want the service and the current container", got)
+	}
+}
+
+func TestCheckInterruptBetweenContainers(t *testing.T) {
+	docker := newCheckDocker()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ui := &rowTerminal{onRow: func(row containerRow) {
+		if row.state == rowUpdated {
+			cancel()
+		}
+	}}
+	app := newApplication(docker, ui)
+
+	err := app.check(ctx, checkOptions{yes: true})
+	if !errors.Is(err, errInterrupted) {
+		t.Fatalf("check() error = %v, want errInterrupted", err)
+	}
+	if got := countDockerCalls(docker.calls, "run"); got != 1 {
+		t.Fatalf("run calls = %d, want only the first container replaced", got)
+	}
+	last := ui.updates[len(ui.updates)-1]
+	if last.state != rowNotStarted {
+		t.Fatalf("last row = %#v, want not started", last)
+	}
+}
+
+func TestReplaceIgnoresCancellation(t *testing.T) {
+	docker := &contextDocker{fakeDocker: fakeDocker{inspectInfo: sampleContainerInfo(), replacementStarted: true}}
+	app := newApplication(docker, &fakeTerminal{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	step := func(_ string, action func() error) error { return action() }
+	if err := app.replace(ctx, sampleContainerInfo(), []string{"run", "--name", "web"}, "web-backup", "sha256:new", step); err != nil {
+		t.Fatalf("replace() error = %v", err)
+	}
+	if got := docker.calls[len(docker.calls)-1]; got[0] != "rm" {
+		t.Fatalf("replacement did not finish: %#v", docker.calls)
+	}
+}
+
+type rowTerminal struct {
+	fakeTerminal
+	scannedRows []containerRow
+	updates     []containerRow
+	onRow       func(containerRow)
+}
+
+func (ui *rowTerminal) scanned(rows []containerRow) { ui.scannedRows = rows }
+
+func (ui *rowTerminal) row(row containerRow) {
+	if row.inUpdatePhase() {
+		ui.updates = append(ui.updates, row)
+	}
+	if ui.onRow != nil {
+		ui.onRow(row)
+	}
+}
+
+// contextDocker fails like the real CLI once its context is cancelled.
+type contextDocker struct {
+	fakeDocker
+}
+
+func (d *contextDocker) run(ctx context.Context, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return d.fakeDocker.run(ctx, args...)
 }

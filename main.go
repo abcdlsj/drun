@@ -6,8 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
+	"syscall"
+
+	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 )
 
 var version = "dev"
@@ -37,24 +42,44 @@ func main() {
 		return
 	}
 
-	ui := newTerminalUI(os.Stdin, os.Stdout, os.Stderr, options.noColor)
-	app := newApplication(newDockerCLI(), ui)
-	var runErr error
-	if options.command == "check" {
-		runErr = app.check(context.Background(), checkOptions{yes: options.yes})
-	} else {
-		runErr = app.refresh(context.Background(), refreshOptions{
+	// Interrupts cancel pending work; replacements already underway finish or roll back first.
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
+
+	run := func(app *application) error {
+		if options.command == "check" {
+			return app.check(ctx, checkOptions{yes: options.yes})
+		}
+		return app.refresh(ctx, refreshOptions{
 			containerName: options.containerName,
 			yes:           options.yes,
 			dryRun:        options.dryRun,
 		})
 	}
-	if runErr != nil {
-		if !errors.Is(runErr, errCancelled) {
+
+	var runErr error
+	if interactiveTerminal(os.Stdin, os.Stdout, options.noColor) {
+		// Resolve adaptive colors before Bubble Tea owns the terminal input.
+		lipgloss.HasDarkBackground()
+		ui := startTUI(os.Stdin, os.Stdout, options.containerName, cancel)
+		runErr = run(newApplication(newDockerCLI(), ui))
+		ui.close(os.Stdout, runErr)
+	} else {
+		ui := newPlainUI(os.Stdin, os.Stdout, os.Stderr)
+		runErr = run(newApplication(newDockerCLI(), ui))
+		if runErr != nil && !errors.Is(runErr, errCancelled) {
 			ui.error(runErr.Error())
 		}
+	}
+	if runErr != nil {
 		os.Exit(1)
 	}
+}
+
+func interactiveTerminal(in, out *os.File, noColor bool) bool {
+	return term.IsTerminal(int(in.Fd())) && term.IsTerminal(int(out.Fd())) && !noColor && os.Getenv("NO_COLOR") == ""
 }
 
 func parseFlags(args []string) (cliOptions, error) {

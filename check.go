@@ -10,169 +10,341 @@ import (
 
 const maxConcurrentImageChecks = 8
 
-type containerSnapshot struct {
-	info  *containerInfo
-	image *imageInfo
+var errInterrupted = errors.New("interrupted; no further changes were made")
+
+type rowState int
+
+const (
+	rowChecking rowState = iota
+	rowUpdatable
+	rowCurrent
+	rowSkipped
+	rowFailed
+	rowQueued
+	rowUpdating
+	rowUpdated
+	rowUnchanged
+	rowUpdateFailed
+	rowNotStarted
+)
+
+// containerRow is one line of the scan: a standalone container or a Compose service.
+type containerRow struct {
+	key    string
+	name   string
+	image  string
+	state  rowState
+	detail string
+	update *updateCandidate
+}
+
+func (row containerRow) inUpdatePhase() bool {
+	return row.state >= rowQueued
+}
+
+type updateCandidate struct {
+	Name           string
+	Image          string
+	Compose        bool
+	Replicas       []string
+	CurrentImageID string
+	LatestImageID  string
+	CurrentVersion string
+	LatestVersion  string
+}
+
+// scanUnit groups the containers that are updated together: one standalone
+// container, or every replica of a Compose service.
+type scanUnit struct {
+	row        *containerRow
+	containers []*containerInfo
+	images     []*imageInfo
+	reference  string
 }
 
 func (a *application) check(ctx context.Context, options checkOptions) error {
-	a.ui.header("Container updates")
-
 	names, err := a.listRunningContainers(ctx)
 	if err != nil {
 		return fmt.Errorf("list running containers: %w", err)
 	}
 	if len(names) == 0 {
-		a.ui.success("No running containers found")
+		a.ui.notice(noticeSuccess, "No running containers found")
 		return nil
 	}
 
-	var snapshots []containerSnapshot
+	var rows []*containerRow
+	var units []*scanUnit
+	_ = a.ui.step(fmt.Sprintf("Inspecting %d running containers", len(names)), func() error {
+		rows, units = a.inspectForScan(ctx, names)
+		return nil
+	})
+	a.ui.rows(rowValues(rows))
+
+	byReference := make(map[string][]*scanUnit)
+	for _, unit := range units {
+		byReference[unit.reference] = append(byReference[unit.reference], unit)
+	}
+	a.checkLatestImages(ctx, sortedKeys(byReference), func(result imageCheckResult) {
+		for _, unit := range byReference[result.reference] {
+			unit.resolve(result)
+			a.ui.row(*unit.row)
+		}
+	})
+	if ctx.Err() != nil {
+		a.ui.notice(noticeWarning, "Interrupted while checking; nothing was changed")
+		return errInterrupted
+	}
+	a.ui.scanned(rowValues(rows))
+
 	checkFailures := 0
-	var warnings []string
-	currentImages := make(map[string]*imageInfo)
-	if err := a.ui.spin(fmt.Sprintf("Inspecting %d running containers", len(names)), func() error {
-		for _, name := range names {
-			info, inspectErr := a.inspect(ctx, name)
-			if inspectErr != nil {
-				checkFailures++
-				warnings = append(warnings, fmt.Sprintf("Could not inspect %s: %s", name, conciseError(inspectErr)))
-				continue
-			}
-			if info.HostConfig.AutoRemove {
-				warnings = append(warnings, fmt.Sprintf("Skipping %s because --rm containers cannot be rolled back", name))
-				continue
-			}
-			image, ok := currentImages[info.Image]
-			if !ok {
-				image, inspectErr = a.inspectImage(ctx, info.Image)
-				if inspectErr != nil {
-					checkFailures++
-					warnings = append(warnings, fmt.Sprintf("Could not inspect the image for %s: %s", name, conciseError(inspectErr)))
-					continue
-				}
-				currentImages[info.Image] = image
-			}
-			snapshots = append(snapshots, containerSnapshot{info: info, image: image})
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, warning := range warnings {
-		a.ui.warning(warning)
-	}
-
-	imageReferences := make(map[string]bool)
-	skippedReferences := make(map[string]bool)
-	for _, snapshot := range snapshots {
-		reference := snapshot.info.Config.Image
-		if remotelyUpdatableImage(reference, snapshot.image) {
-			imageReferences[reference] = true
-		} else {
-			skippedReferences[reference] = true
-		}
-	}
-	if len(skippedReferences) > 0 {
-		label := "images"
-		if len(skippedReferences) == 1 {
-			label = "image"
-		}
-		a.ui.info(fmt.Sprintf("Skipped %d local or pinned %s", len(skippedReferences), label))
-	}
-	references := sortedKeys(imageReferences)
-	latestImages := make(map[string]*imageInfo, len(references))
-	imageErrors := make(map[string]error)
-	if len(references) > 0 {
-		checkMessage := fmt.Sprintf("Checking %d images", len(references))
-		if len(references) == 1 {
-			checkMessage = "Checking " + references[0]
-		}
-		if err := a.ui.spin(checkMessage, func() error {
-			latestImages, imageErrors = a.checkLatestImages(ctx, references)
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	for _, reference := range references {
-		if err := imageErrors[reference]; err != nil {
+	var updates []*containerRow
+	for _, row := range rows {
+		switch row.state {
+		case rowFailed:
 			checkFailures++
-			a.ui.warning(fmt.Sprintf("Could not check %s: %s", reference, conciseError(err)))
+		case rowUpdatable:
+			updates = append(updates, row)
 		}
 	}
-
-	updates := make([]updateCandidate, 0)
-	for _, snapshot := range snapshots {
-		latest, ok := latestImages[snapshot.info.Config.Image]
-		if !ok || sameImageID(snapshot.info.Image, latest.ID) {
-			continue
-		}
-		updates = append(updates, newUpdateCandidate(snapshot.info, snapshot.image, latest))
-	}
-	sort.Slice(updates, func(i, j int) bool { return updates[i].Name < updates[j].Name })
-
 	if len(updates) == 0 {
 		if checkFailures > 0 {
 			return newCheckSummaryError(checkFailures, 0)
 		}
-		a.ui.success(fmt.Sprintf("No updates available across %d running containers", len(names)))
+		a.ui.notice(noticeSuccess, fmt.Sprintf("All %d running containers are up to date", len(names)))
 		return nil
 	}
 
-	var selected []updateCandidate
-	if options.yes {
-		a.ui.listUpdates(updates)
-		selected = updates
-	} else if !a.ui.isInteractive() {
-		a.ui.listUpdates(updates)
-		a.ui.info("Run drun check --yes to update every listed container")
+	var selectedKeys []string
+	switch {
+	case options.yes:
+		for _, row := range updates {
+			selectedKeys = append(selectedKeys, row.key)
+		}
+	case !a.ui.interactive():
+		a.ui.notice(noticeInfo, "Run drun --yes to update every listed container")
 		return newCheckSummaryError(checkFailures, 0)
-	} else {
-		selected, err = a.ui.selectUpdates(updates)
+	default:
+		selectedKeys, err = a.ui.selectUpdates(rowValues(rows))
 		if err != nil {
 			return fmt.Errorf("select containers: %w", err)
 		}
 	}
+	selected := selectRows(updates, selectedKeys)
 	if len(selected) == 0 {
-		a.ui.warning("No containers selected")
+		a.ui.notice(noticeWarning, "No containers selected")
 		return newCheckSummaryError(checkFailures, 0)
 	}
 
-	updated := 0
-	alreadyCurrent := 0
-	updateFailures := 0
-	for index, candidate := range selected {
-		a.ui.group(fmt.Sprintf("%s  %d/%d", candidate.Name, index+1, len(selected)))
-		changed, err := a.updateCheckedContainer(ctx, candidate)
-		if err != nil {
+	for _, row := range selected {
+		row.state = rowQueued
+		row.detail = "queued"
+		a.ui.row(*row)
+	}
+	updated, unchanged, updateFailures, notStarted := 0, 0, 0, 0
+	for _, row := range selected {
+		if ctx.Err() != nil {
+			notStarted++
+			row.state, row.detail = rowNotStarted, "not started"
+			a.ui.row(*row)
+			continue
+		}
+		row.state, row.detail = rowUpdating, "Checking current state"
+		a.ui.row(*row)
+		step := func(title string, action func() error) error {
+			row.detail = title
+			a.ui.row(*row)
+			return action()
+		}
+		changed, err := a.updateCheckedContainer(ctx, *row.update, step)
+		switch {
+		case err != nil:
 			updateFailures++
-			a.ui.warning("Update failed: " + conciseError(err))
-			a.ui.endGroup()
-			continue
+			row.state, row.detail = rowUpdateFailed, updateFailureDetail(err)
+		case !changed:
+			unchanged++
+			row.state, row.detail = rowUnchanged, "already up to date"
+		default:
+			updated++
+			row.state, row.detail = rowUpdated, row.update.CurrentVersion+" → "+row.update.LatestVersion
 		}
-		if !changed {
-			alreadyCurrent++
-			a.ui.info("Already updated")
-			a.ui.endGroup()
-			continue
-		}
-		updated++
-		a.ui.success(fmt.Sprintf("Updated %s → %s", candidate.CurrentVersion, candidate.LatestVersion))
-		a.ui.endGroup()
+		a.ui.row(*row)
 	}
 
+	total := len(selected)
 	switch {
-	case updated == len(selected):
-		a.ui.success(fmt.Sprintf("Updated all %d selected containers", updated))
-	case alreadyCurrent == len(selected):
-		a.ui.success(fmt.Sprintf("All %d selected containers were already current", alreadyCurrent))
-	case updated+alreadyCurrent == len(selected):
-		a.ui.success(fmt.Sprintf("Updated %d containers; %d were already current", updated, alreadyCurrent))
+	case notStarted > 0:
+		a.ui.notice(noticeWarning, fmt.Sprintf("Stopped after %d of %d; %d not started", total-notStarted, total, notStarted))
+		return errInterrupted
+	case updated == total:
+		a.ui.notice(noticeSuccess, fmt.Sprintf("Updated %s", plural(updated, "container")))
+	case unchanged == total:
+		a.ui.notice(noticeSuccess, fmt.Sprintf("All %s were already up to date", plural(unchanged, "selected container")))
+	case updateFailures == 0:
+		a.ui.notice(noticeSuccess, fmt.Sprintf("Updated %s; %d already up to date", plural(updated, "container"), unchanged))
 	default:
-		a.ui.warning(fmt.Sprintf("Updated %d of %d selected containers", updated, len(selected)))
+		a.ui.notice(noticeWarning, fmt.Sprintf("Updated %d of %d selected", updated, total))
 	}
 	return newCheckSummaryError(checkFailures, updateFailures)
+}
+
+// inspectForScan inspects containers and their images in batches, classifying
+// every container as failed, skipped, or still to be checked against its registry.
+func (a *application) inspectForScan(ctx context.Context, names []string) ([]*containerRow, []*scanUnit) {
+	var rows []*containerRow
+	fail := func(name, image string, err error) {
+		rows = append(rows, &containerRow{key: "container:" + name, name: name, image: image, state: rowFailed, detail: conciseError(err)})
+	}
+	skip := func(name, image, reason string) {
+		rows = append(rows, &containerRow{key: "container:" + name, name: name, image: image, state: rowSkipped, detail: reason})
+	}
+
+	infos, err := a.inspectMany(ctx, names)
+	if err != nil {
+		// A container may have exited since docker ps; fall back to one call per container.
+		infos = infos[:0]
+		for _, name := range names {
+			info, inspectErr := a.inspect(ctx, name)
+			if inspectErr != nil {
+				fail(name, "", inspectErr)
+				continue
+			}
+			infos = append(infos, info)
+		}
+	}
+
+	images, imageErrors := a.inspectImagesOf(ctx, infos)
+	unitsByKey := make(map[string]*scanUnit)
+	var units []*scanUnit
+	for _, info := range infos {
+		name, reference := containerName(info), info.Config.Image
+		if info.HostConfig.AutoRemove {
+			skip(name, reference, "created with --rm")
+			continue
+		}
+		if err := imageErrors[info.Image]; err != nil {
+			fail(name, reference, err)
+			continue
+		}
+		image := images[info.Image]
+		compose, isCompose, err := composeServiceFromContainer(info)
+		if err != nil {
+			skip(name, reference, err.Error())
+			continue
+		}
+		if reason := localImageReason(reference, image); reason != "" {
+			skip(name, reference, reason)
+			continue
+		}
+
+		key := "container:" + name
+		if isCompose {
+			key = "compose:" + compose.project + "/" + compose.service + "/" + reference
+		}
+		if unit, ok := unitsByKey[key]; ok {
+			unit.containers = append(unit.containers, info)
+			unit.images = append(unit.images, image)
+			continue
+		}
+		row := &containerRow{key: key, name: name, image: reference, state: rowChecking, detail: "checking"}
+		unit := &scanUnit{row: row, containers: []*containerInfo{info}, images: []*imageInfo{image}, reference: reference}
+		unitsByKey[key] = unit
+		units = append(units, unit)
+		rows = append(rows, row)
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
+	return rows, units
+}
+
+func (a *application) inspectImagesOf(ctx context.Context, infos []*containerInfo) (map[string]*imageInfo, map[string]error) {
+	ids := make(map[string]bool)
+	for _, info := range infos {
+		if !info.HostConfig.AutoRemove {
+			ids[info.Image] = true
+		}
+	}
+	references := sortedKeys(ids)
+	images := make(map[string]*imageInfo, len(references))
+	imageErrors := make(map[string]error)
+	if len(references) == 0 {
+		return images, imageErrors
+	}
+	if batch, err := a.inspectImages(ctx, references); err == nil {
+		for index, reference := range references {
+			images[reference] = batch[index]
+		}
+		return images, imageErrors
+	}
+	for _, reference := range references {
+		image, err := a.inspectImage(ctx, reference)
+		if err != nil {
+			imageErrors[reference] = err
+			continue
+		}
+		images[reference] = image
+	}
+	return images, imageErrors
+}
+
+func (unit *scanUnit) resolve(result imageCheckResult) {
+	row := unit.row
+	if result.err != nil {
+		row.state, row.detail = rowFailed, conciseError(result.err)
+		return
+	}
+	var current *imageInfo
+	for index, info := range unit.containers {
+		if !sameImageID(info.Image, result.image.ID) {
+			current = unit.images[index]
+			break
+		}
+	}
+	if current == nil {
+		row.state, row.detail = rowCurrent, "up to date"
+		return
+	}
+	candidate := newUpdateCandidate(unit.containers, current, result.image)
+	row.state, row.detail, row.update = rowUpdatable, candidate.CurrentVersion+" → "+candidate.LatestVersion, &candidate
+}
+
+// updateFailureDetail keeps the rollback outcome visible next to the cause.
+func updateFailureDetail(err error) string {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "rollback failed"):
+		return "rollback failed: " + conciseError(err)
+	case strings.Contains(message, "original container restored"):
+		return "restored original: " + conciseError(err)
+	}
+	return conciseError(err)
+}
+
+func rowValues(rows []*containerRow) []containerRow {
+	values := make([]containerRow, len(rows))
+	for index, row := range rows {
+		values[index] = *row
+	}
+	return values
+}
+
+func selectRows(rows []*containerRow, keys []string) []*containerRow {
+	wanted := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		wanted[key] = true
+	}
+	var selected []*containerRow
+	for _, row := range rows {
+		if wanted[row.key] {
+			selected = append(selected, row)
+		}
+	}
+	return selected
+}
+
+func plural(count int, noun string) string {
+	if count == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", count, noun)
 }
 
 type checkSummaryError struct {
@@ -224,6 +396,18 @@ func conciseError(err error) string {
 	return message
 }
 
+// localImageReason explains why an image cannot be refreshed from a registry, or returns "".
+func localImageReason(reference string, image *imageInfo) string {
+	reference = strings.TrimSpace(reference)
+	if strings.HasPrefix(reference, "sha256:") || strings.Contains(reference, "@") {
+		return "pinned by digest"
+	}
+	if !remotelyUpdatableImage(reference, image) {
+		return "local image"
+	}
+	return ""
+}
+
 func remotelyUpdatableImage(reference string, image *imageInfo) bool {
 	reference = strings.TrimSpace(reference)
 	if reference == "" || strings.HasPrefix(reference, "sha256:") || strings.Contains(reference, "@") || image == nil {
@@ -256,13 +440,12 @@ type imageCheckResult struct {
 	err       error
 }
 
-func (a *application) checkLatestImages(ctx context.Context, references []string) (map[string]*imageInfo, map[string]error) {
-	latestImages := make(map[string]*imageInfo, len(references))
-	imageErrors := make(map[string]error)
+// checkLatestImages pulls each reference with bounded concurrency and reports
+// every result on the calling goroutine as soon as it arrives.
+func (a *application) checkLatestImages(ctx context.Context, references []string, onResult func(imageCheckResult)) {
 	if len(references) == 0 {
-		return latestImages, imageErrors
+		return
 	}
-
 	jobs := make(chan string, len(references))
 	results := make(chan imageCheckResult, len(references))
 	for _, reference := range references {
@@ -270,29 +453,17 @@ func (a *application) checkLatestImages(ctx context.Context, references []string
 	}
 	close(jobs)
 
-	workerCount := min(maxConcurrentImageChecks, len(references))
-	for range workerCount {
+	for range min(maxConcurrentImageChecks, len(references)) {
 		go func() {
 			for reference := range jobs {
-				if _, err := a.docker.run(ctx, "pull", reference); err != nil {
-					results <- imageCheckResult{reference: reference, err: err}
-					continue
-				}
-				image, err := a.inspectImage(ctx, reference)
+				image, err := a.pullImage(ctx, reference)
 				results <- imageCheckResult{reference: reference, image: image, err: err}
 			}
 		}()
 	}
-
 	for range references {
-		result := <-results
-		if result.err != nil {
-			imageErrors[result.reference] = result.err
-			continue
-		}
-		latestImages[result.reference] = result.image
+		onResult(<-results)
 	}
-	return latestImages, imageErrors
 }
 
 func (a *application) listRunningContainers(ctx context.Context) ([]string, error) {
@@ -305,44 +476,62 @@ func (a *application) listRunningContainers(ctx context.Context) ([]string, erro
 	return names, nil
 }
 
-func (a *application) updateCheckedContainer(ctx context.Context, candidate updateCandidate) (bool, error) {
-	info, err := a.inspect(ctx, candidate.Name)
+// updateCheckedContainer re-validates a candidate picked during the scan and
+// replaces it. It reports false when every replica already runs the latest image.
+func (a *application) updateCheckedContainer(ctx context.Context, candidate updateCandidate, step stepFunc) (bool, error) {
+	replicas := candidate.Replicas
+	if len(replicas) == 0 {
+		replicas = []string{candidate.Name}
+	}
+	infos, err := a.inspectMany(ctx, replicas)
 	if err != nil {
 		return false, err
 	}
-	if !info.State.Running {
-		return false, errors.New("container is no longer running")
+	outdated := false
+	for _, info := range infos {
+		if !info.State.Running {
+			return false, fmt.Errorf("%s is no longer running", containerName(info))
+		}
+		if sameImageID(info.Image, candidate.LatestImageID) {
+			continue
+		}
+		if !sameImageID(info.Image, candidate.CurrentImageID) {
+			return false, fmt.Errorf("%s image changed during selection (%s -> %s)", containerName(info), shortImageID(candidate.CurrentImageID), shortImageID(info.Image))
+		}
+		outdated = true
 	}
-	if sameImageID(info.Image, candidate.LatestImageID) {
+	if !outdated {
 		return false, nil
 	}
-	if !sameImageID(info.Image, candidate.CurrentImageID) {
-		return false, fmt.Errorf("container image changed during selection (%s -> %s)", shortImageID(candidate.CurrentImageID), shortImageID(info.Image))
-	}
-	currentImage, err := a.inspectImage(ctx, info.Image)
-	if err != nil {
-		return false, err
-	}
+
+	info := infos[0]
 	compose, isCompose, err := composeServiceFromContainer(info)
 	if err != nil {
 		return false, err
 	}
 	if isCompose {
-		args := compose.upArgs()
-		return true, a.replaceCompose(ctx, info, args, candidate.LatestImageID)
+		return true, a.replaceCompose(ctx, compose.upArgs(), replicas, candidate.LatestImageID, step)
+	}
+	currentImage, err := a.inspectImage(ctx, info.Image)
+	if err != nil {
+		return false, err
 	}
 	runArgs := buildRunArgs(info, &currentImage.Config)
-	backupName := backupContainerName(candidate.Name, a.now())
-	return true, a.replace(ctx, info, runArgs, backupName, candidate.LatestImageID)
+	return true, a.replace(ctx, info, runArgs, backupContainerName(candidate.Name, a.now()), candidate.LatestImageID, step)
 }
 
-func newUpdateCandidate(info *containerInfo, current, latest *imageInfo) updateCandidate {
+func newUpdateCandidate(infos []*containerInfo, current, latest *imageInfo) updateCandidate {
 	currentVersion, latestVersion := displayImageVersions(current, latest)
+	replicas := make([]string, len(infos))
+	for index, info := range infos {
+		replicas[index] = containerName(info)
+	}
 	return updateCandidate{
-		Name:           strings.TrimPrefix(info.Name, "/"),
-		Image:          info.Config.Image,
-		Compose:        isComposeContainer(info),
-		CurrentImageID: info.Image,
+		Name:           replicas[0],
+		Image:          infos[0].Config.Image,
+		Compose:        isComposeContainer(infos[0]),
+		Replicas:       replicas,
+		CurrentImageID: current.ID,
 		LatestImageID:  latest.ID,
 		CurrentVersion: currentVersion,
 		LatestVersion:  latestVersion,
