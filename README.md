@@ -17,7 +17,7 @@ Containers managed by Docker Compose are detected automatically from their stand
 - Shows the exact replacement command before changing the container
 - Preserves ports, volumes, environment variables, labels, restart policy, capabilities, networks, entrypoint, user, working directory, and common security options
 - Restores the original standalone container automatically when replacement fails
-- Shows every container in one live table: check progress, version changes, and per-container update status
+- Groups every container by status (updates, up to date, skipped, failed) in one live view with check progress, version changes, and per-container update steps
 - Finishes an in-progress replacement safely when interrupted with Ctrl+C
 - Supports non-interactive automation and plain-text output
 
@@ -95,7 +95,7 @@ drun check
 
 Set the standard `NO_COLOR` environment variable to disable color as well.
 
-Running `drun` without a container scans every running container for updates. `drun check` is an equivalent compatibility command. Each running container appears in one table with its image and status: available update, up to date, skipped (local image, digest pin, or `--rm`), or failed. No updates are selected by default: use the arrow keys to move, Space to toggle an item, `a` to select or clear all, and Enter to update the selection. While updating, the table follows each selected container through its replacement steps.
+Running `drun` without a container scans every running container for updates. `drun check` is an equivalent compatibility command. Running containers are grouped by status: available updates first, then failed checks, up-to-date containers, and skipped ones (local image, digest pin, or `--rm`). On short terminals the lower groups fold into one line each. No updates are selected by default: use the arrow keys to move, Space to toggle an item, `a` to select or clear all, and Enter to update the selection. While updating, the table follows each selected container through its replacement steps.
 
 Checking for updates pulls each unique remote image once, but it does not stop or replace any container until the selection is confirmed. Locally built images and images pinned by digest are skipped. Running Docker Compose containers are detected from their standard labels and marked as `compose` in the update list. Replicas of the same Compose service are grouped and recreated with one `docker compose up`. Single-container refreshes print the exact `docker compose up` command before confirmation; batch updates keep the output compact. Stopped or not-yet-created Compose services are not discovered. In non-interactive output, `drun` only lists updates unless `--yes` is supplied.
 

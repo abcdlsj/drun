@@ -30,12 +30,19 @@ const (
 
 // containerRow is one line of the scan: a standalone container or a Compose service.
 type containerRow struct {
-	key    string
-	name   string
-	image  string
-	state  rowState
-	detail string
-	update *updateCandidate
+	key      string
+	name     string
+	image    string
+	compose  bool
+	replicas int
+	state    rowState
+	detail   string
+	update   *updateCandidate
+}
+
+// containerCount is the number of running containers the row stands for.
+func (row containerRow) containerCount() int {
+	return max(1, row.replicas)
 }
 
 func (row containerRow) inUpdatePhase() bool {
@@ -243,9 +250,10 @@ func (a *application) inspectForScan(ctx context.Context, names []string) ([]*co
 		if unit, ok := unitsByKey[key]; ok {
 			unit.containers = append(unit.containers, info)
 			unit.images = append(unit.images, image)
+			unit.row.replicas++
 			continue
 		}
-		row := &containerRow{key: key, name: name, image: reference, state: rowChecking, detail: "checking"}
+		row := &containerRow{key: key, name: name, image: reference, compose: isCompose, replicas: 1, state: rowChecking, detail: "checking"}
 		unit := &scanUnit{row: row, containers: []*containerInfo{info}, images: []*imageInfo{image}, reference: reference}
 		unitsByKey[key] = unit
 		units = append(units, unit)
@@ -299,7 +307,7 @@ func (unit *scanUnit) resolve(result imageCheckResult) {
 		}
 	}
 	if current == nil {
-		row.state, row.detail = rowCurrent, "up to date"
+		row.state, row.detail = rowCurrent, displayImageIdentity(result.image)
 		return
 	}
 	candidate := newUpdateCandidate(unit.containers, current, result.image)

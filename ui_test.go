@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -139,9 +141,6 @@ func TestUpdateSelection(t *testing.T) {
 	reply := make(chan []string, 1)
 	model := send(newTUIModel("", nil), rowsMsg{rows: sampleRows()})
 	model = send(model, selectRequestMsg{reply: reply})
-	if model.rows[0].state != rowUpdatable || model.rows[1].state != rowUpdatable {
-		t.Fatalf("updates are not listed first: %#v", model.rows)
-	}
 
 	model = send(model, tea.KeyMsg{Type: tea.KeyEnter})
 	if len(reply) != 0 {
@@ -163,18 +162,44 @@ func TestUpdateSelection(t *testing.T) {
 	}
 }
 
-func TestTableRendering(t *testing.T) {
+func TestScanSections(t *testing.T) {
 	model := send(newTUIModel("", nil), tea.WindowSizeMsg{Width: 100, Height: 40})
 	model = send(model, rowsMsg{rows: sampleRows()})
 	view := model.View()
-	for _, text := range []string{"drun", "2 updates · 1 up to date · 1 skipped", "web", "v1.4.2 → v1.5.0", "compose ×2", "ghcr.io/acme/web:main", "local image"} {
-		if !strings.Contains(view, text) {
-			t.Fatalf("view does not contain %q:\n%s", text, view)
+	order := []string{"5 containers", "UPDATES  2", "web", "v1.4.2 → v1.5.0", "compose ×2", "api", "UP TO DATE  1", "redis", "SKIPPED  1", "local image"}
+	last := -1
+	for _, text := range order {
+		at := strings.Index(view, text)
+		if at <= last {
+			t.Fatalf("view does not contain %q after the previous item:\n%s", text, view)
 		}
+		last = at
 	}
 	for _, line := range strings.Split(view, "\n") {
 		if width := ansi.StringWidth(line); width > 100 {
 			t.Fatalf("line is %d columns wide, wider than the terminal: %q", width, line)
+		}
+	}
+}
+
+func TestScanFitsHeight(t *testing.T) {
+	var rows []containerRow
+	for index := range 12 {
+		rows = append(rows, containerRow{key: fmt.Sprint("u", index), name: fmt.Sprint("app-", index), image: "acme/app:latest",
+			state: rowUpdatable, update: &updateCandidate{CurrentVersion: "v1", LatestVersion: "v2"}})
+		rows = append(rows, containerRow{key: fmt.Sprint("c", index), name: fmt.Sprint("db-", index), image: "postgres:16", state: rowCurrent, detail: "16.4"})
+	}
+	model := send(newTUIModel("", nil), tea.WindowSizeMsg{Width: 80, Height: 16})
+	model = send(model, rowsMsg{rows: rows})
+	model = send(model, selectRequestMsg{reply: make(chan []string, 1)})
+
+	view := model.View()
+	if height := lipgloss.Height(view); height > 16 {
+		t.Fatalf("view is %d lines, taller than the terminal:\n%s", height, view)
+	}
+	for _, text := range []string{"drun", "UPDATES  12", "app-0", "↓", "UP TO DATE  12   db-0 · db-1", "q quit"} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("short view does not contain %q:\n%s", text, view)
 		}
 	}
 }
@@ -186,11 +211,30 @@ func TestUpdatePhaseRows(t *testing.T) {
 	model = send(model, rowMsg{row: row})
 
 	view := model.View()
-	if !strings.Contains(view, "Starting the replacement") || strings.Contains(view, "redis") {
+	if !strings.Contains(view, "UPDATING  1") || !strings.Contains(view, "Starting the replacement") || strings.Contains(view, "redis") {
 		t.Fatalf("update view should only show containers being updated:\n%s", view)
 	}
-	if !strings.Contains(view, "2 updates") {
-		t.Fatalf("header lost the scan summary during updates:\n%s", view)
+	if !strings.Contains(view, "0/1") {
+		t.Fatalf("header does not show update progress:\n%s", view)
+	}
+}
+
+func TestRefreshView(t *testing.T) {
+	model := send(newTUIModel("web", nil), stepStartMsg{title: "Inspecting web"})
+	model = send(model, stepEndMsg{})
+	model = send(model, targetMsg{info: sampleContainerInfo()})
+	model = send(model, planMsg{update: &updateCandidate{CurrentVersion: "v1.4.2", LatestVersion: "v1.5.0"}, command: []string{"docker", "run", "nginx:latest"}})
+	model = send(model, stepStartMsg{title: "Stopping the current container"})
+
+	view := model.View()
+	order := []string{"drun", "web", "running", "nginx:latest", "standalone", "Inspecting web", "UPDATE", "v1.5.0", "docker run nginx:latest", "Stopping the current container", "ctrl+c"}
+	last := -1
+	for _, text := range order {
+		at := strings.Index(view, text)
+		if at <= last {
+			t.Fatalf("view does not contain %q after the previous item:\n%s", text, view)
+		}
+		last = at
 	}
 }
 
@@ -229,8 +273,8 @@ func sampleRows() []containerRow {
 	web := &updateCandidate{Name: "demo-web-1", Compose: true, Replicas: []string{"demo-web-1", "demo-web-2"}, CurrentVersion: "v1.4.2", LatestVersion: "v1.5.0"}
 	api := &updateCandidate{Name: "api", CurrentVersion: "a1b2c3", LatestVersion: "d4e5f6"}
 	return []containerRow{
-		{key: "compose:demo/web", name: "web", image: "ghcr.io/acme/web:main", state: rowUpdatable, detail: "v1.4.2 → v1.5.0", update: web},
-		{key: "container:redis", name: "redis", image: "redis:7", state: rowCurrent, detail: "up to date"},
+		{key: "compose:demo/web", name: "web", image: "ghcr.io/acme/web:main", compose: true, replicas: 2, state: rowUpdatable, detail: "v1.4.2 → v1.5.0", update: web},
+		{key: "container:redis", name: "redis", image: "redis:7", state: rowCurrent, detail: "7.4.1"},
 		{key: "container:api", name: "api", image: "acme/api:latest", state: rowUpdatable, detail: "a1b2c3 → d4e5f6", update: api},
 		{key: "container:builder", name: "builder", image: "local/build:dev", state: rowSkipped, detail: "local image"},
 	}

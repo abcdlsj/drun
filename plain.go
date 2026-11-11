@@ -85,8 +85,8 @@ func (ui *plainUI) scanned(rows []containerRow) {
 	fmt.Fprintln(writer, "NAME\tSTATE\tIMAGE\tDETAIL")
 	for _, row := range rows {
 		detail := strings.ReplaceAll(row.detail, "→", "->")
-		if row.update != nil && row.update.Compose {
-			detail += " [compose" + replicaSuffix(row.update) + "]"
+		if tag := composeTag(row); tag != "" {
+			detail += " [" + tag + "]"
 		}
 		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", row.name, plainState(row.state), row.image, detail)
 	}
@@ -121,11 +121,4 @@ func plainState(state rowState) string {
 	default:
 		return "checking"
 	}
-}
-
-func replicaSuffix(update *updateCandidate) string {
-	if len(update.Replicas) > 1 {
-		return fmt.Sprintf(" ×%d", len(update.Replicas))
-	}
-	return ""
 }
